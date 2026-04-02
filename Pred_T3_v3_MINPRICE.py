@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Target3 SUPERADOR v3.0 — Full Rewrite
+Target3 SUPERADOR v3.0 - Full Rewrite
 ======================================
 Fixes applied (vs v2.4):
   A) Walk-forward: embargo scaled to feature lookback, non-overlapping val folds,
@@ -39,9 +39,9 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import GradientBoostingClassifier
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                        CONFIGURATION                            ║
-# ╚══════════════════════════════════════════════════════════════════╝
+# #+==================================================================+#
+# #                        CONFIGURATION                            #
+# #+==================================================================+#
 
 BASE_DIR = Path(r"C:\Users\GOFOYCOP_01\00.Redes neuronales\04.Descarga anual\03.consolidado")
 FILE_NAME = "Consolidado_100_semanas_paste_todos.xlsx"
@@ -49,11 +49,11 @@ FILE_PATH = BASE_DIR / FILE_NAME
 
 TOP_K = 15
 
-# Walk-forward — FIX A1: embargo scaled to longest feature lookback
+# Walk-forward - FIX A1: embargo scaled to longest feature lookback
 N_FOLDS = 6
 # With RET_3M (~12 weeks lookback), embargo must be >= 4 weeks to avoid
 # autocorrelation leakage. We use max(4, user_override).
-EMBARGO_DATES = 4  # was 1 — insufficient for multi-week features
+EMBARGO_DATES = 4  # was 1 - insufficient for multi-week features
 MIN_TRAIN_DATES = 35
 TEST_DATES_PER_FOLD = None
 
@@ -64,7 +64,7 @@ HALF_LIFE_WEEKS = 26
 # Last close
 MAX_NAN_FRAC_LAST = 0.55
 
-# Blend weights — initial values, will be tuned per-fold (nested)
+# Blend weights - initial values, will be tuned per-fold (nested)
 W_CLF_INIT = 0.65
 W_RNK_INIT = 0.35
 
@@ -75,7 +75,7 @@ np.random.seed(SEED)
 MIN_PRICE_FILTER = 5.0
 APPLY_PRICE_FILTER_TO_LAST_CLOSE = True
 
-# ── NEW: G-improvements config ─────────────────────────────────────
+# -- NEW: G-improvements config -------------------------------------
 USE_SECTOR_NEUTRALISATION = True     # G: sector demeaning
 SECTOR_COL = "Sector"                # column name in Excel (set None if absent)
 
@@ -91,12 +91,12 @@ SCORE_SMOOTHING_ALPHA = 0.0          # G: 0 = no smoothing; 0.3 = moderate EMA
 # If > 0, requires historical RankScores (loaded from prior run output)
 PRIOR_SCORES_PATH = None             # Path to previous run's All_Last sheet
 
-# File versioning — FIX E3
-DATE_STAMP = datetime.now().strftime('%Y-%m-%d_%H%M%S')  # includes time → no silent overwrite
+# File versioning - FIX E3
+DATE_STAMP = datetime.now().strftime('%Y-%m-%d_%H%M%S')  # includes time -> no silent overwrite
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                          HELPERS                                ║
-# ╚══════════════════════════════════════════════════════════════════╝
+# #+==================================================================+#
+# #                          HELPERS                                #
+# #+==================================================================+#
 
 def compute_input_hash(path: Path, first_n_bytes: int = 2**20) -> str:
     """FIX E3: SHA-256 of input file for reproducibility tracking."""
@@ -134,7 +134,7 @@ def time_decay_weights(date_series, half_life_weeks=26):
     return w.astype(float)
 
 
-# ── FIX A2: non-overlapping walk-forward splits ────────────────────
+# -- FIX A2: non-overlapping walk-forward splits --------------------
 def make_walkforward_splits(
     unique_dates,
     n_folds: int = 6,
@@ -201,7 +201,7 @@ def precision_at_k_by_date(df_pred, date_col, y_true_col, score_col, k=15):
     return float(np.mean(precs)) if precs else np.nan
 
 
-# ── FIX D3: permutation test for P@K ──────────────────────────────
+# -- FIX D3: permutation test for P@K ------------------------------
 def permutation_test_p_at_k(
     df_pred, date_col, y_true_col, score_col, k=15, n_perm=1000, seed=42
 ):
@@ -248,7 +248,7 @@ def build_clf(spw, seed=42):
     )
 
 
-# ── FIX B1: multi-level relevance for ranker ──────────────────────
+# -- FIX B1: multi-level relevance for ranker ----------------------
 def build_ranker(seed=42):
     return LGBMRanker(
         objective="lambdarank",
@@ -270,7 +270,7 @@ def compute_relevance_labels(y_binary: np.ndarray, prob_clf: np.ndarray) -> np.n
     """
     FIX B1: Instead of binary {0, 2}, create multi-level relevance:
       0 = negative (y=0, low prob)
-      1 = negative but model-uncertain (y=0, high prob — hard negatives)
+      1 = negative but model-uncertain (y=0, high prob - hard negatives)
       2 = positive but model-uncertain (y=1, low prob)
       3 = positive and model-confident (y=1, high prob)
 
@@ -296,7 +296,7 @@ def apply_price_filter(dataframe, price_col, min_price=None):
     return dataframe[pd.to_numeric(dataframe[price_col], errors="coerce") > float(min_price)].copy()
 
 
-# ── FIX C2: gap-aware shift ───────────────────────────────────────
+# -- FIX C2: gap-aware shift ---------------------------------------
 def gap_aware_shift(df, tick_col, date_col, value_col, periods=1, max_gap_weeks=2):
     """
     Shift that returns NaN when there's a time gap > max_gap_weeks.
@@ -310,7 +310,7 @@ def gap_aware_shift(df, tick_col, date_col, value_col, periods=1, max_gap_weeks=
     return result
 
 
-# ── FIX C3: date consistency diagnostic ───────────────────────────
+# -- FIX C3: date consistency diagnostic ---------------------------
 def diagnose_date_consistency(df, tick_col, date_col):
     """
     Reports how many distinct calendar dates exist per _DateKey.
@@ -321,15 +321,15 @@ def diagnose_date_consistency(df, tick_col, date_col):
     inconsistent = by_date[by_date["nunique"] > 1]
     if len(inconsistent) > 0:
         max_spread = (inconsistent["max"] - inconsistent["min"]).max()
-        print(f"  ⚠ DATE CONSISTENCY: {len(inconsistent)} _DateKey groups have "
+        print(f"  [WARN] DATE CONSISTENCY: {len(inconsistent)} _DateKey groups have "
               f"multiple raw dates (max spread: {max_spread})")
         print(f"    Recommendation: normalize to week-ending Friday before ranking.")
     else:
-        print("  ✓ Date consistency OK: 1 raw date per _DateKey.")
+        print("  [OK] Date consistency OK: 1 raw date per _DateKey.")
     return inconsistent
 
 
-# ── G: Market regime feature ──────────────────────────────────────
+# -- G: Market regime feature --------------------------------------
 def compute_market_regime(df, tick_col, date_col, price_col, spy_ticker="SPY"):
     """
     Computes a market regime feature based on SPY:
@@ -342,7 +342,7 @@ def compute_market_regime(df, tick_col, date_col, price_col, spy_ticker="SPY"):
     """
     spy = df[df[tick_col] == spy_ticker].sort_values(date_col).copy()
     if len(spy) < 5:
-        print(f"  ⚠ SPY not found or too few rows for regime computation")
+        print(f"  [WARN] SPY not found or too few rows for regime computation")
         return pd.DataFrame()
 
     spy["spy_ret_4w"] = spy[price_col].pct_change(4)
@@ -370,7 +370,7 @@ def compute_market_regime(df, tick_col, date_col, price_col, spy_ticker="SPY"):
     return regime_df
 
 
-# ── G: Short-term features ────────────────────────────────────────
+# -- G: Short-term features ----------------------------------------
 def add_short_term_features(df, tick_col, date_col, price_col):
     """
     Adds features capturing 1-4 week dynamics:
@@ -417,7 +417,7 @@ def add_short_term_features(df, tick_col, date_col, price_col):
 
     # Intra-week reversal: if last week was extreme, expect reversal
     ret_1w_rank = df.groupby("_DateKey")["Ret_1w"].rank(pct=True)
-    df["ReversalSignal_1w"] = 1.0 - ret_1w_rank  # high rank → low signal (expect reversal)
+    df["ReversalSignal_1w"] = 1.0 - ret_1w_rank  # high rank -> low signal (expect reversal)
 
     new_cols = ["MomAccel_1w", "PriceToHigh4w", "PriceToLow4w",
                 "VolZScore_8w", "ReversalSignal_1w"]
@@ -428,7 +428,7 @@ def add_short_term_features(df, tick_col, date_col, price_col):
     return df, new_cols
 
 
-# ── G: Sector neutralisation ──────────────────────────────────────
+# -- G: Sector neutralisation --------------------------------------
 def sector_neutralise(df, feature_cols, date_col, sector_col):
     """
     Cross-sectional demeaning by sector: subtract sector-date mean from each feature.
@@ -439,7 +439,7 @@ def sector_neutralise(df, feature_cols, date_col, sector_col):
     stock-specific alpha. Particularly helps RankerPct stability WoW.
     """
     if sector_col not in df.columns:
-        print(f"  ⚠ Sector column '{sector_col}' not found — skipping neutralisation")
+        print(f"  [WARN] Sector column '{sector_col}' not found - skipping neutralisation")
         return df, []
 
     neutral_cols = []
@@ -449,13 +449,13 @@ def sector_neutralise(df, feature_cols, date_col, sector_col):
         df[ncol] = df[c] - sector_mean
         neutral_cols.append(ncol)
 
-    print(f"  ✓ Sector-neutralised {len(neutral_cols)} features")
+    print(f"  [OK] Sector-neutralised {len(neutral_cols)} features")
     return df, neutral_cols
 
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                      1) LOAD + NORMALISE                        ║
-# ╚══════════════════════════════════════════════════════════════════╝
+# #+==================================================================+#
+# #                      1) LOAD + NORMALISE                        #
+# #+==================================================================+#
 
 print(f"Input hash: {INPUT_HASH}")
 df = pd.read_excel(FILE_PATH)
@@ -494,9 +494,9 @@ df = df.sort_values([TICK_COL, DATE_COL]).reset_index(drop=True)
 print("\n--- Date Consistency Diagnostic ---")
 diagnose_date_consistency(df, TICK_COL, DATE_COL)
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                      2) FEATURES                                ║
-# ╚══════════════════════════════════════════════════════════════════╝
+# #+==================================================================+#
+# #                      2) FEATURES                                #
+# #+==================================================================+#
 
 # FIX C1: expanded leak audit
 leak_cols = set([
@@ -555,7 +555,7 @@ df = ensure_numeric(df, fe_new)
 print("\n--- Adding short-term features ---")
 df, short_term_cols = add_short_term_features(df, TICK_COL, "_DateKey", PRICE_COL)
 df = ensure_numeric(df, short_term_cols)
-print(f"  ✓ Added {len(short_term_cols)} short-term features: {short_term_cols}")
+print(f"  [OK] Added {len(short_term_cols)} short-term features: {short_term_cols}")
 
 # G: market regime
 print("\n--- Computing market regime ---")
@@ -563,7 +563,7 @@ regime_df = compute_market_regime(df, TICK_COL, "_DateKey", PRICE_COL)
 if len(regime_df) > 0:
     df = df.merge(regime_df, on="_DateKey", how="left")
     regime_cols = ["spy_ret_4w", "spy_vol_4w", "MarketRegime"]
-    print(f"  ✓ Added regime features: {regime_cols}")
+    print(f"  [OK] Added regime features: {regime_cols}")
 else:
     regime_cols = []
 
@@ -602,9 +602,9 @@ feature_cols = [c for c in all_feature_candidates
 feature_cols = list(dict.fromkeys(feature_cols))  # deduplicate preserving order
 print(f"\nTotal features finales: {len(feature_cols)}")
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                   ANCHOR DATE (FIX E1)                          ║
-# ╚══════════════════════════════════════════════════════════════════╝
+# #+==================================================================+#
+# #                   ANCHOR DATE (FIX E1)                          #
+# #+==================================================================+#
 
 # FIX E1: compute anchor from mode of tickers' max dates, not just SPY
 last_dates_by_ticker = df.dropna(subset=["_DateKey"]).groupby(TICK_COL)["_DateKey"].max()
@@ -613,7 +613,7 @@ GLOBAL_ANCHOR_DATE = anchor_candidates.index[0]  # most common max date
 
 spy_anchor = last_dates_by_ticker.get("SPY", None)
 if spy_anchor is not None and spy_anchor != GLOBAL_ANCHOR_DATE:
-    print(f"  ⚠ SPY anchor ({spy_anchor.date()}) differs from mode anchor "
+    print(f"  [WARN] SPY anchor ({spy_anchor.date()}) differs from mode anchor "
           f"({GLOBAL_ANCHOR_DATE.date()}). Using mode.")
 
 ticker_coverage = anchor_candidates.iloc[0] / len(last_dates_by_ticker)
@@ -621,12 +621,12 @@ print(f"Anchor global: {GLOBAL_ANCHOR_DATE.date()} "
       f"(coverage: {ticker_coverage:.1%} of tickers)")
 
 if ticker_coverage < 0.5:
-    print(f"  ⚠ WARNING: anchor date covers <50% of tickers. "
+    print(f"  [WARN] WARNING: anchor date covers <50% of tickers. "
           f"Data may be stale or incomplete.")
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                     CORE PIPELINE                               ║
-# ╚══════════════════════════════════════════════════════════════════╝
+# #+==================================================================+#
+# #                     CORE PIPELINE                               #
+# #+==================================================================+#
 
 # FIX E2: cache reusable components between runs
 _shared_cache: Dict[str, Any] = {}
@@ -650,7 +650,7 @@ def run_pipeline(
     print(f"RUN: {run_label}")
     print("=" * 80)
 
-    # ──── Training data ────
+    # ---- Training data ----
     df_train_base = apply_price_filter(df_all, PRICE_COL, min_price_filter)
     train_df = df_train_base[df_train_base["y_t3"].notna()].copy()
     train_df = train_df.dropna(subset=["_DateKey"]).copy()
@@ -676,23 +676,23 @@ def run_pipeline(
     for _, va in splits:
         overlap = all_val_dates & set(va)
         if overlap:
-            print(f"  ⚠ VALIDATION OVERLAP detected: {len(overlap)} dates")
+            print(f"  [WARN] VALIDATION OVERLAP detected: {len(overlap)} dates")
         all_val_dates.update(va)
-    print(f"  ✓ Total unique validation dates: {len(all_val_dates)}")
+    print(f"  [OK] Total unique validation dates: {len(all_val_dates)}")
 
     oof_clf = np.full(len(train_df), np.nan, dtype=float)
     oof_rnk = np.full(len(train_df), np.nan, dtype=float)
     best_iters_clf, best_iters_rnk = [], []
     fold_rows = []
 
-    # ──── Walk-forward folds ────
+    # ---- Walk-forward folds ----
     for k, (tr_dates, te_dates) in enumerate(splits, start=1):
         tr = train_df[train_df["_DateKey"].isin(tr_dates)].copy()
         te = train_df[train_df["_DateKey"].isin(te_dates)].copy()
 
         # FIX A3: log skipped folds explicitly instead of silent continue
         if len(tr) < 2000 or len(te) < 200:
-            print(f"[{run_label}] Fold {k}: SKIP (tr={len(tr)}, te={len(te)}) — "
+            print(f"[{run_label}] Fold {k}: SKIP (tr={len(tr)}, te={len(te)}) - "
                   f"below minimum threshold. Impact: reduces OOF coverage.")
             continue
 
@@ -803,7 +803,7 @@ def run_pipeline(
         print(f"[{run_label}] Fold {k}: AUC={auc:.4f} PR-AUC={ap:.4f} "
               f"P@{TOP_K}={p15:.3f} W_CLF={best_w_fold:.2f}")
 
-    # ──── OOF aggregation ────
+    # ---- OOF aggregation ----
     mask = np.isfinite(oof_clf) & np.isfinite(oof_rnk)
     if mask.sum() == 0:
         raise ValueError(f"[{run_label}] No valid OOF predictions.")
@@ -822,10 +822,10 @@ def run_pipeline(
     W_RNK = 1.0 - W_CLF
     df_oof["RankScore"] = W_CLF * df_oof["Prob_Clf"] + W_RNK * df_oof["RankerPct"]
 
-    print(f"\n[{run_label}] ✅ Weights (median of fold-level): "
+    print(f"\n[{run_label}] [PASS] Weights (median of fold-level): "
           f"W_CLF={W_CLF:.2f} | W_RNK={W_RNK:.2f}")
 
-    # ── G: Optional stacking meta-model ───────────────────────────
+    # -- G: Optional stacking meta-model ---------------------------
     use_stacking_this_run = USE_STACKING and mask.sum() > 1000
 
     if use_stacking_this_run:
@@ -862,10 +862,10 @@ def run_pipeline(
 
         if p15_stack > p15_linear:
             df_oof["RankScore"] = df_oof["StackScore"]
-            print(f"[{run_label}] → Using stacking (better P@K)")
+            print(f"[{run_label}] -> Using stacking (better P@K)")
         else:
             use_stacking_this_run = False
-            print(f"[{run_label}] → Keeping linear blend (stacking didn't improve)")
+            print(f"[{run_label}] -> Keeping linear blend (stacking didn't improve)")
 
     # Platt calibration
     platt = LogisticRegression(max_iter=2000, random_state=SEED)
@@ -901,7 +901,7 @@ def run_pipeline(
     print(f"[{run_label}] BaseRate={base_rate:.2%}")
     print(f"[{run_label}] P@{TOP_K}={p_at_k:.3f}")
 
-    # ──── Final model fit ────
+    # ---- Final model fit ----
     n_estim_clf = safe_median_best(best_iters_clf, 2500)
     n_estim_rnk = safe_median_best(best_iters_rnk, 1200)
 
@@ -975,7 +975,7 @@ def run_pipeline(
         "oof_rank_stats": oof_rank_stats,
     }
 
-    # ──── Score last close ────
+    # ---- Score last close ----
     if min_price_filter is not None and APPLY_PRICE_FILTER_TO_LAST_CLOSE:
         df_score_base = apply_price_filter(df_all, PRICE_COL, min_price_filter)
     else:
@@ -991,7 +991,7 @@ def run_pipeline(
     anchor_coverage = df_last[TICK_COL].nunique() / max(1, total_tickers)
 
     if anchor_coverage < 0.5:
-        print(f"  ⚠ ANCHOR FALLBACK: only {anchor_coverage:.1%} coverage at "
+        print(f"  [WARN] ANCHOR FALLBACK: only {anchor_coverage:.1%} coverage at "
               f"{GLOBAL_ANCHOR_DATE.date()}. Using per-ticker last row.")
         df_last = (
             df_score_base
@@ -1002,7 +1002,7 @@ def run_pipeline(
         )
         df_last = df_last.drop_duplicates(subset=[TICK_COL], keep="last")
     else:
-        print(f"  ✓ Anchor coverage: {anchor_coverage:.1%} ({df_last[TICK_COL].nunique()} tickers)")
+        print(f"  [OK] Anchor coverage: {anchor_coverage:.1%} ({df_last[TICK_COL].nunique()} tickers)")
 
     # Missing tickers diagnostic
     last_by_ticker = df_score_base.dropna(subset=["_DateKey"]).groupby(TICK_COL)["_DateKey"].max()
@@ -1060,12 +1060,12 @@ def run_pipeline(
         oof_rank_stats["std"], 1e-6
     )
     if mean_shift > 1.5:
-        print(f"  ⚠ DISTRIBUTION SHIFT: RankScore mean shifted {mean_shift:.1f} "
+        print(f"  [WARN] DISTRIBUTION SHIFT: RankScore mean shifted {mean_shift:.1f} "
               f"std from OOF (OOF: {oof_rank_stats['mean']:.3f}, "
               f"Last: {last_rank_stats['mean']:.3f})")
         print(f"    Platt calibration may be unreliable. Consider re-calibrating.")
     else:
-        print(f"  ✓ RankScore distribution shift: {mean_shift:.2f} std (acceptable)")
+        print(f"  [OK] RankScore distribution shift: {mean_shift:.2f} std (acceptable)")
 
     out["Prob_T3_FINAL"] = platt.predict_proba(out[["RankScore"]].values)[:, 1]
 
@@ -1083,9 +1083,9 @@ def run_pipeline(
                 + (1 - SCORE_SMOOTHING_ALPHA) * out.loc[has_prior, "RankScore"]
             )
             out.drop(columns=["RankScore_prev"], inplace=True)
-            print(f"  ✓ Score smoothing applied (alpha={SCORE_SMOOTHING_ALPHA})")
+            print(f"  [OK] Score smoothing applied (alpha={SCORE_SMOOTHING_ALPHA})")
         except Exception as e:
-            print(f"  ⚠ Score smoothing failed: {e}")
+            print(f"  [WARN] Score smoothing failed: {e}")
 
     # Sort and rank
     sort_cols = ["RankScore", "Prob_Clf", "RankerPct"]
@@ -1124,7 +1124,7 @@ def run_pipeline(
             print(f"[{run_label}] Turnover vs prior week: {turnover:.1%} "
                   f"({len(overlap)} tickers retained)")
             if turnover > 0.8:
-                print(f"  ⚠ HIGH TURNOVER (>80%): signal may be noisy. "
+                print(f"  [WARN] HIGH TURNOVER (>80%): signal may be noisy. "
                       f"Consider increasing SCORE_SMOOTHING_ALPHA.")
         except Exception:
             turnover_info = "N/A (no prior file)"
@@ -1202,7 +1202,7 @@ def run_pipeline(
         fold_df.to_excel(writer, sheet_name="Fold_Metrics", index=False)
         missing_df.to_excel(writer, sheet_name="Missing_LastClose", index=False)
 
-    print(f"\n[{run_label}] ✅ Exported: {out_file}")
+    print(f"\n[{run_label}] [PASS] Exported: {out_file}")
     print(f"[{run_label}] Anchor date: {GLOBAL_ANCHOR_DATE.date()}")
     print(f"[{run_label}] Top {dynamic_k}:")
     display_cols = ["Rank", TICK_COL, PRICE_COL, "RankScore", "Prob_T3_FINAL",
@@ -1212,12 +1212,12 @@ def run_pipeline(
     return out
 
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                       EXECUTION                                 ║
-# ╚══════════════════════════════════════════════════════════════════╝
+# #+==================================================================+#
+# #                       EXECUTION                                 #
+# #+==================================================================+#
 
 print("\n" + "=" * 80)
-print("PIPELINE v3.0 — Starting dual execution")
+print("PIPELINE v3.0 - Starting dual execution")
 print("=" * 80)
 
 result_full = run_pipeline(
@@ -1239,7 +1239,7 @@ result_filter = run_pipeline(
 )
 
 print("\n" + "=" * 80)
-print("PIPELINE v3.0 — COMPLETED")
+print("PIPELINE v3.0 - COMPLETED")
 print(f"File 1: {OUT_FILE_FULL}")
 print(f"File 2: {OUT_FILE_FILTER}")
 print(f"Input hash: {INPUT_HASH}")
