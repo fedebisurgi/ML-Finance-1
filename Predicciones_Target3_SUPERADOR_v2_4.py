@@ -4,9 +4,9 @@ Target3 SUPERADOR v2.4 (DOBLE EXPORT): Full + MinPrice Filter
 -------------------------------------------------------------
 Exporta 2 Excels:
 1) Universo completo (igual al actual)
-2) Universo filtrado por precio mínimo configurable para:
-   - entrenamiento / regresión
-   - scoring final del último cierre
+2) Universo filtrado por precio minimo configurable para:
+   - entrenamiento / regresion
+   - scoring final del ultimo cierre
 
 Filtro configurable:
     MIN_PRICE_FILTER = 2.0
@@ -47,7 +47,7 @@ TEST_DATES_PER_FOLD = None
 USE_TIME_DECAY = True
 HALF_LIFE_WEEKS = 26
 
-# Último cierre
+# Ultimo cierre
 MAX_NAN_FRAC_LAST = 0.55
 
 # Blend weights iniciales
@@ -60,8 +60,8 @@ np.random.seed(SEED)
 # ===== NUEVO: filtro modificable =====
 MIN_PRICE_FILTER = 5.0
 
-# Si querés que el filtro se aplique SOLO al entrenamiento y NO al scoring final,
-# poné esto en False. Así como está, se aplica a ambos en el excel filtrado.
+# Si queres que el filtro se aplique SOLO al entrenamiento y NO al scoring final,
+# pone esto en False. Asi como esta, se aplica a ambos en el excel filtrado.
 APPLY_PRICE_FILTER_TO_LAST_CLOSE = True
 
 DATE_STAMP = datetime.now().strftime('%Y-%m-%d')
@@ -415,7 +415,7 @@ def run_pipeline(df_all, min_price_filter=None, out_file=None, run_label="FULL")
 
     mask = np.isfinite(oof_clf) & np.isfinite(oof_rnk)
     if mask.sum() == 0:
-        raise ValueError(f"[{run_label}] No hubo predicciones OOF válidas. Revisá el filtro o el tamaño de la muestra.")
+        raise ValueError(f"[{run_label}] No hubo predicciones OOF validas. Revisa el filtro o el tamano de la muestra.")
 
     y_oof = train_df.loc[mask, "y_t3_int"].values
 
@@ -426,7 +426,7 @@ def run_pipeline(df_all, min_price_filter=None, out_file=None, run_label="FULL")
     df_oof["RankerPct"] = df_oof.groupby("_DateKey")["Score_Ranker"].rank(pct=True)
     df_oof["RankScore"] = W_CLF * df_oof["Prob_Clf"] + W_RNK * df_oof["RankerPct"]
 
-    # búsqueda de mejores pesos
+    # busqueda de mejores pesos
     best_w = None
     best_p15 = -1
 
@@ -443,9 +443,9 @@ def run_pipeline(df_all, min_price_filter=None, out_file=None, run_label="FULL")
     W_RNK = 1.0 - best_w
     df_oof["RankScore"] = W_CLF * df_oof["Prob_Clf"] + W_RNK * df_oof["RankerPct"]
 
-    print(f"[{run_label}] ✅ Best weights OOF: W_CLF={W_CLF:.2f} | W_RNK={W_RNK:.2f} | P@{TOP_K}={best_p15:.3f}")
+    print(f"[{run_label}] [PASS] Best weights OOF: W_CLF={W_CLF:.2f} | W_RNK={W_RNK:.2f} | P@{TOP_K}={best_p15:.3f}")
 
-    # calibración Platt
+    # calibracion Platt
     platt = LogisticRegression(max_iter=2000, random_state=SEED)
     platt.fit(df_oof[["RankScore"]].values, y_oof)
     df_oof["Prob_T3_FINAL"] = platt.predict_proba(df_oof[["RankScore"]].values)[:, 1]
@@ -513,7 +513,7 @@ def run_pipeline(df_all, min_price_filter=None, out_file=None, run_label="FULL")
     )
     rnk_final.fit(X_full_r, y_full_rel, group=g_full)
 
-    # -------- último cierre --------
+    # -------- ultimo cierre --------
     if min_price_filter is not None and APPLY_PRICE_FILTER_TO_LAST_CLOSE:
         df_score_base = apply_price_filter(df_all, PRICE_COL, min_price_filter)
     else:
@@ -544,7 +544,7 @@ def run_pipeline(df_all, min_price_filter=None, out_file=None, run_label="FULL")
     df_last = df_last[nan_frac_last <= MAX_NAN_FRAC_LAST].copy()
 
     if len(df_last) == 0:
-        raise ValueError(f"[{run_label}] No quedaron tickers en el último cierre luego de filtros.")
+        raise ValueError(f"[{run_label}] No quedaron tickers en el ultimo cierre luego de filtros.")
 
     X_last = imp_final.transform(df_last[feature_cols].replace([np.inf, -np.inf], np.nan).values)
     p_last = clf_final.predict_proba(X_last)[:, 1]
@@ -623,13 +623,13 @@ def run_pipeline(df_all, min_price_filter=None, out_file=None, run_label="FULL")
         fold_df.to_excel(writer, sheet_name="Fold_Metrics", index=False)
         missing_df.to_excel(writer, sheet_name="Missing_LastClose", index=False)
 
-    print(f"\n[{run_label}] ✅ Export OK: {out_file}")
+    print(f"\n[{run_label}] [PASS] Export OK: {out_file}")
     print(f"[{run_label}] Anchor date: {GLOBAL_ANCHOR_DATE.date()}")
     print(f"[{run_label}] Top {TOP_K}:")
     print(topk[["Rank", TICK_COL, PRICE_COL, "RankScore", "Prob_T3_FINAL", "Prob_Clf", "RankerPct"]].to_string(index=False))
 
 # =========================
-# 6) EJECUCIÓN DOBLE
+# 6) EJECUCION DOBLE
 # =========================
 run_pipeline(
     df_all=df,
