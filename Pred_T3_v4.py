@@ -472,6 +472,12 @@ print(f"Datos cargados: {df.shape}")
 
 df.columns = [clean_colname(c) for c in df.columns]
 
+# v4 FIX: deduplicate column names (ocurre al pegar datos de múltiples fuentes en Excel)
+if df.columns.duplicated().any():
+    dup_cols = df.columns[df.columns.duplicated(keep=False)].unique().tolist()
+    print(f"  ⚠ Columnas duplicadas detectadas y eliminadas (se mantiene la primera): {dup_cols}")
+    df = df.loc[:, ~df.columns.duplicated(keep='first')]
+
 TICK_COL = "Ticker"
 DATE_COL = "Data_Date"
 PRICE_COL = "Close" if "Close" in df.columns else ("Precio" if "Precio" in df.columns else None)
@@ -947,8 +953,19 @@ def run_pipeline(
     clf_final.fit(X_full, y_full, sample_weight=w_full)
 
     # ── v4: Feature importance diagnostic ────────────────────────────
+    # Usar n_features_in_ del modelo como fuente de verdad para el largo.
+    # Si hay mismatch con feature_cols (columnas duplicadas en el Excel origen),
+    # se usan los nombres disponibles y se avisa.
+    n_model_feats = len(clf_final.feature_importances_)
+    if n_model_feats == len(feature_cols):
+        feat_names_imp = feature_cols
+    else:
+        print(f"  ⚠ Mismatch feature importance: feature_cols={len(feature_cols)}, "
+              f"model={n_model_feats}. Probable causa: columnas duplicadas en el Excel. "
+              f"Usando nombres indexados como fallback.")
+        feat_names_imp = (feature_cols + [f"_extra_{i}" for i in range(n_model_feats)])[:n_model_feats]
     feat_imp_df = pd.DataFrame({
-        "Feature": feature_cols,
+        "Feature": feat_names_imp,
         "Importance": clf_final.feature_importances_,
     }).sort_values("Importance", ascending=False).reset_index(drop=True)
     print(f"\n[{run_label}] Top-10 features by importance:")
