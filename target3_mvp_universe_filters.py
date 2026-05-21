@@ -977,13 +977,16 @@ def run_pipeline(
 
     # Avg Ret Top20 - Bot20
     if RET_REAL_COL and RET_REAL_COL in holdout_scored.columns:
-        ret_top20 = holdout_scored.groupby("_DateKey").apply(
-            lambda g: g.nlargest(TOP_K, "RankScore")[RET_REAL_COL].mean()
-        ).mean()
-        ret_bot20 = holdout_scored.groupby("_DateKey").apply(
-            lambda g: g.nsmallest(TOP_K, "RankScore")[RET_REAL_COL].mean()
-        ).mean()
-        avg_ret_spread = float(ret_top20 - ret_bot20)
+        try:
+            ret_top20 = holdout_scored.groupby("_DateKey").apply(
+                lambda g: g.nlargest(TOP_K, "RankScore")[RET_REAL_COL].mean()
+            ).mean()
+            ret_bot20 = holdout_scored.groupby("_DateKey").apply(
+                lambda g: g.nsmallest(TOP_K, "RankScore")[RET_REAL_COL].mean()
+            ).mean()
+            avg_ret_spread = float(ret_top20 - ret_bot20)
+        except (TypeError, ValueError):
+            avg_ret_spread = np.nan
     else:
         # Proxy: diferencia de tasas de acierto
         p_top20 = hold_p20
@@ -994,14 +997,20 @@ def run_pipeline(
         avg_ret_spread = float(p_top20 - p_bot20)
 
     # Hit rate Top20 vs SPY (si SPY tiene retorno en holdout)
-    spy_rets = holdout_scored[holdout_scored[TICK_COL] == "SPY"][["_DateKey", "Prob_T3_FINAL"]]
+    # groupby+mean garantiza índice único → .get() devuelve scalar, no Series
+    spy_mask = holdout_scored[TICK_COL] == "SPY"
+    spy_rets  = holdout_scored[spy_mask]
     if RET_REAL_COL and RET_REAL_COL in holdout_scored.columns and len(spy_rets):
-        spy_ret_by_date = holdout_scored[holdout_scored[TICK_COL] == "SPY"].set_index("_DateKey")[RET_REAL_COL]
+        spy_ret_by_date = spy_rets.groupby("_DateKey")[RET_REAL_COL].mean()
         hit_rates = []
         for dt, g in holdout_scored.groupby("_DateKey"):
+            if RET_REAL_COL not in g.columns:
+                continue
             top20 = g.nlargest(TOP_K, "RankScore")
-            spy_r = spy_ret_by_date.get(dt, np.nan)
-            if pd.notna(spy_r) and RET_REAL_COL in top20.columns:
+            spy_r_raw = spy_ret_by_date.get(dt, np.nan)
+            # .get() en Series con índice único devuelve scalar; float() lo fuerza
+            spy_r = float(spy_r_raw) if pd.notna(spy_r_raw) else np.nan
+            if not np.isnan(spy_r):
                 hit_rates.append(float((top20[RET_REAL_COL] > spy_r).mean()))
         hit_rate_vs_spy = float(np.mean(hit_rates)) if hit_rates else np.nan
     else:
@@ -1269,16 +1278,24 @@ print("=== FASE 3: MÉTRICAS COMPARATIVAS ===")
 print(SEP)
 
 def _fmt(v, fmt=".3f"):
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+    # float() acepta int, numpy.float64, numpy.float32, etc.
+    try:
+        if v is None:
+            return "  N/A  "
+        fv = float(v)
+        return "  N/A  " if np.isnan(fv) else format(fv, fmt)
+    except (TypeError, ValueError):
         return "  N/A  "
-    return format(v, fmt)
 
 def _delta(new_val, base_val, fmt=".3f"):
-    if any(v is None or (isinstance(v, float) and np.isnan(v)) for v in [new_val, base_val]):
+    try:
+        nv, bv = float(new_val), float(base_val)
+        if np.isnan(nv) or np.isnan(bv):
+            return "  N/A"
+        d = nv - bv
+        return f"{'+'if d>=0 else ''}{d:{fmt}}"
+    except (TypeError, ValueError):
         return "  N/A"
-    d = new_val - base_val
-    sign = "+" if d >= 0 else ""
-    return f"{sign}{d:{fmt}}"
 
 rows = [
     ("Métrica",                 "BASELINE",                      "ABLATION",                     "NEW",                          "Δ (NEW-BASE)"),
