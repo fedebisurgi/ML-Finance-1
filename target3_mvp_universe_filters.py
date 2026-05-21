@@ -110,6 +110,18 @@ CORR_ALERT_THRESHOLD = 0.85
 
 DATE_STAMP = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
+# ── Backtest walk-forward ────────────────────────────────────────
+# 18 fechas (2026-01-02 a 2026-05-15). 27/3 y 3/4 omitidas a propósito.
+BACKTEST_DATES = [
+    "2026-01-02", "2026-01-09", "2026-01-16", "2026-01-23", "2026-01-30",
+    "2026-02-06", "2026-02-13", "2026-02-20", "2026-02-27",
+    "2026-03-06", "2026-03-13", "2026-03-20",
+    "2026-04-10", "2026-04-17", "2026-04-24",
+    "2026-05-01", "2026-05-08", "2026-05-15",
+]
+# Tiempo máximo estimado antes de pedir confirmación (horas)
+BACKTEST_MAX_HOURS_AUTO = 1.5
+
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                          HELPERS                                ║
@@ -127,6 +139,10 @@ INPUT_HASH = compute_input_hash(FILE_PATH) if FILE_PATH.exists() else "NOHASH"
 OUT_FILE_BASELINE  = BASE_DIR / f"T5_BASELINE_{DATE_STAMP}_{INPUT_HASH}.xlsx"
 OUT_FILE_ABLATION  = BASE_DIR / f"T5_ABLATION_{DATE_STAMP}_{INPUT_HASH}.xlsx"
 OUT_FILE_NEW       = BASE_DIR / f"T5_NEW_{DATE_STAMP}_{INPUT_HASH}.xlsx"
+
+OUT_FILE_BT_BASELINE = BASE_DIR / f"T5_BACKTEST_BASELINE_{DATE_STAMP}_{INPUT_HASH}.xlsx"
+OUT_FILE_BT_ABLATION = BASE_DIR / f"T5_BACKTEST_ABLATION_{DATE_STAMP}_{INPUT_HASH}.xlsx"
+OUT_FILE_BT_NEW      = BASE_DIR / f"T5_BACKTEST_NEW_{DATE_STAMP}_{INPUT_HASH}.xlsx"
 
 
 def clean_colname(c: str) -> str:
@@ -1174,6 +1190,421 @@ def run_pipeline(
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║              BACKTEST WALK-FORWARD (v6.0)                       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def run_single_backtest(
+    df_all: pd.DataFrame,
+    anchor_date: pd.Timestamp,
+    feature_cols: list,
+    universe_mask_col: str,
+    run_label: str,
+) -> Optional[pd.DataFrame]:
+    """
+    Entrena con datos ESTRICTAMENTE anteriores a anchor_date y puntúa anchor_date.
+
+    Regla de no look-ahead:
+      - y_t3 en fecha X se observa en X+1w → sólo disponible para fechas <= anchor_date - 7d.
+      - features ya son point-in-time (computadas en el df global por fecha).
+      - ranks cross-sectional: se computan por fecha en el df global → sin leakage cross-date.
+
+    Retorna DataFrame Top-20 o None si la fecha no existe o hay < 50 tickers.
+    """
+    cutoff = anchor_date - pd.Timedelta(weeks=1)
+
+    # ── Universo para esta anchor_date ──────────────────────────
+    mask = df_all[universe_mask_col].fillna(False)
+    df_filt = df_all[mask].copy()
+
+    # ── Scoring set: sólo rows en anchor_date ────────────────────
+    scoring_df = df_filt[df_filt["_DateKey"] == anchor_date].copy()
+    if len(scoring_df) == 0:
+        print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: fecha no existe en _DateKey.")
+        return None
+    if len(scoring_df) < 50:
+        print(f"  [BT {run_label}] anchor={anchor_date.date()} → WARNING: universo={len(scoring_df)} < 50 tickers.")
+
+    # ── Train set: fechas <= cutoff con y_t3 conocido ───────────
+    train_df = df_filt[
+        (df_filt["_DateKey"] <= cutoff) & df_filt["y_t3"].notna()
+    ].copy()
+    train_df = train_df.dropna(subset=["_DateKey"])
+    train_df["y_t3_int"] = train_df["y_t3"].astype(int)
+    train_df = train_df.reset_index(drop=True)
+
+    # ── Assert obligatorio: sin look-ahead ───────────────────────
+    assert train_df["_DateKey"].max() <= cutoff, \
+        f"LOOK-AHEAD DETECTED at anchor={anchor_date.date()}"
+
+    if len(train_df) < 2000:
+        print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: train muy pequeño ({len(train_df)} rows).")
+        return None
+
+    unique_dates = sorted(train_df["_DateKey"].unique())
+    splits = make_walkforward_splits(
+        unique_dates, N_FOLDS, EMBARGO_DATES, MIN_TRAIN_DATES, TEST_DATES_PER_FOLD
+    )
+    if not splits:
+        print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: sin splits walk-forward.")
+        return None
+
+    oof_clf = np.full(len(train_df), np.nan)
+    oof_rnk = np.full(len(train_df), np.nan)
+    best_iters_clf, best_iters_rnk, fold_weights = [], [], []
+
+    for k, (tr_dates, te_dates) in enumerate(splits, 1):
+        tr = train_df[train_df["_DateKey"].isin(tr_dates)].copy()
+        te = train_df[train_df["_DateKey"].isin(te_dates)].copy()
+        if len(tr) < 2000 or len(te) < 200:
+            continue
+
+        imp = SimpleImputer(strategy="median")
+        X_tr = imp.fit_transform(tr[feature_cols].replace([np.inf, -np.inf], np.nan))
+        X_te = imp.transform(te[feature_cols].replace([np.inf, -np.inf], np.nan))
+        y_tr, y_te = tr["y_t3_int"].values, te["y_t3_int"].values
+        w_tr = time_decay_weights(tr["_DateKey"], HALF_LIFE_WEEKS).values if USE_TIME_DECAY else None
+        spw = max(1, int((y_tr == 0).sum())) / max(1, int((y_tr == 1).sum()))
+
+        clf = build_clf(spw, SEED)
+        clf.fit(
+            X_tr, y_tr, sample_weight=w_tr,
+            eval_set=[(X_te, y_te)], eval_metric="auc",
+            callbacks=[lgb.early_stopping(80, verbose=False), lgb.log_evaluation(0)],
+        )
+        p_te = clf.predict_proba(X_te)[:, 1]
+        oof_clf[te.index.values] = p_te
+        best_iters_clf.append(getattr(clf, "best_iteration_", None))
+
+        tr_s = tr.sort_values(["_DateKey", TICK_COL])
+        te_s = te.sort_values(["_DateKey", TICK_COL])
+        g_tr = tr_s.groupby("_DateKey").size().values
+        g_te = te_s.groupby("_DateKey").size().values
+        X_tr_r = imp.transform(tr_s[feature_cols].replace([np.inf, -np.inf], np.nan))
+        X_te_r = imp.transform(te_s[feature_cols].replace([np.inf, -np.inf], np.nan))
+        y_tr_rel = compute_relevance_labels(tr_s["y_t3_int"].values, clf.predict_proba(X_tr_r)[:, 1])
+        y_te_rel = compute_relevance_labels(te_s["y_t3_int"].values, clf.predict_proba(X_te_r)[:, 1])
+
+        rnk = build_ranker(SEED)
+        rnk.fit(
+            X_tr_r, y_tr_rel, group=g_tr,
+            eval_set=[(X_te_r, y_te_rel)], eval_group=[g_te],
+            callbacks=[lgb.early_stopping(80, verbose=False), lgb.log_evaluation(0)],
+        )
+        s_te = rnk.predict(X_te_r)
+        oof_rnk[te.index.values] = pd.Series(s_te, index=te_s.index).loc[te.index].values
+        best_iters_rnk.append(getattr(rnk, "best_iteration_", None))
+
+        te_eval = te[["_DateKey", "y_t3_int"]].copy()
+        te_eval["Prob_Clf"]     = p_te
+        te_eval["Score_Ranker"] = oof_rnk[te.index.values]
+        te_eval["RankerPct"]    = te_eval.groupby("_DateKey")["Score_Ranker"].rank(pct=True)
+        best_w_fold, best_p_fold = W_CLF_INIT, -1.0
+        for w in np.arange(0.35, 0.86, 0.05):
+            tmp = te_eval.copy()
+            tmp["S"] = w * tmp["Prob_Clf"] + (1 - w) * tmp["RankerPct"]
+            p = precision_at_k_by_date(tmp, "_DateKey", "y_t3_int", "S", TOP_K)
+            if p > best_p_fold:
+                best_p_fold, best_w_fold = p, float(w)
+        fold_weights.append(best_w_fold)
+
+    valid = np.isfinite(oof_clf) & np.isfinite(oof_rnk)
+    if valid.sum() == 0:
+        print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: sin OOF válidas.")
+        return None
+
+    y_oof = train_df.loc[valid, "y_t3_int"].values
+    df_oof = train_df.loc[valid, ["_DateKey"]].copy()
+    df_oof["RankScore"] = (
+        float(np.median(fold_weights) if fold_weights else W_CLF_INIT) * oof_clf[valid]
+        + (1.0 - float(np.median(fold_weights) if fold_weights else W_CLF_INIT))
+        * pd.Series(oof_rnk[valid]).groupby(train_df.loc[valid, "_DateKey"]).rank(pct=True).values
+    )
+    W_CLF_bt = float(np.median(fold_weights)) if fold_weights else W_CLF_INIT
+    W_RNK_bt = 1.0 - W_CLF_bt
+
+    # Platt calibration en OOF
+    platt_bt = LogisticRegression(max_iter=2000, random_state=SEED)
+    platt_bt.fit(df_oof[["RankScore"]].values, y_oof)
+
+    # ── Modelo final entrenado en TODOS los datos de train ───────
+    n_clf = safe_median_best(best_iters_clf, 2500)
+    n_rnk = safe_median_best(best_iters_rnk, 1200)
+
+    imp_final = SimpleImputer(strategy="median")
+    X_full = imp_final.fit_transform(train_df[feature_cols].replace([np.inf, -np.inf], np.nan))
+    y_full = train_df["y_t3_int"].values
+    w_full = time_decay_weights(train_df["_DateKey"], HALF_LIFE_WEEKS).values if USE_TIME_DECAY else None
+    spw_full = max(1, int((y_full == 0).sum())) / max(1, int((y_full == 1).sum()))
+
+    clf_final = LGBMClassifier(
+        objective="binary", n_estimators=n_clf, learning_rate=0.02,
+        num_leaves=63, subsample=0.85, colsample_bytree=0.85,
+        reg_alpha=0.3, reg_lambda=0.6, min_child_samples=70,
+        scale_pos_weight=spw_full, n_jobs=-1, random_state=SEED,
+    )
+    clf_final.fit(X_full, y_full, sample_weight=w_full)
+
+    train_s = train_df.sort_values(["_DateKey", TICK_COL])
+    X_full_r = imp_final.transform(train_s[feature_cols].replace([np.inf, -np.inf], np.nan))
+    y_full_rel = compute_relevance_labels(
+        train_s["y_t3_int"].values, clf_final.predict_proba(X_full_r)[:, 1]
+    )
+    g_full = train_s.groupby("_DateKey").size().values
+
+    rnk_final = LGBMRanker(
+        objective="lambdarank", n_estimators=n_rnk, learning_rate=0.03,
+        num_leaves=63, min_data_in_leaf=60, subsample=0.85, colsample_bytree=0.85,
+        reg_alpha=0.5, reg_lambda=0.8, random_state=SEED, n_jobs=-1, verbosity=-1,
+    )
+    rnk_final.fit(X_full_r, y_full_rel, group=g_full)
+
+    # ── Scoring en anchor_date ────────────────────────────────────
+    scoring_df = scoring_df.copy()
+    nan_frac = scoring_df[feature_cols].isna().mean(axis=1)
+    scoring_df = scoring_df[nan_frac <= MAX_NAN_FRAC_LAST].copy()
+
+    if len(scoring_df) == 0:
+        print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: scoring vacío tras NaN filter.")
+        return None
+
+    X_sc = imp_final.transform(scoring_df[feature_cols].replace([np.inf, -np.inf], np.nan))
+    p_sc = clf_final.predict_proba(X_sc)[:, 1]
+
+    sc_s = scoring_df.sort_values(TICK_COL)
+    X_sc_r = imp_final.transform(sc_s[feature_cols].replace([np.inf, -np.inf], np.nan))
+    s_sc_r = rnk_final.predict(X_sc_r)
+    s_sc_aligned = pd.Series(s_sc_r, index=sc_s.index).loc[scoring_df.index].values
+
+    # Incluir y_t3 para calcular P@20_realized en summary (NaN si aún no disponible)
+    _extra_cols = [c for c in [TICK_COL, PRICE_COL, "y_t3"] if c in scoring_df.columns]
+    out = scoring_df[_extra_cols].copy()
+    out["Prob_Clf"]      = p_sc
+    out["Score_Ranker"]  = s_sc_aligned
+    out["RankerPct"]     = out["Score_Ranker"].rank(pct=True)
+    out["RankScore"]     = W_CLF_bt * out["Prob_Clf"] + W_RNK_bt * out["RankerPct"]
+    out["Prob_T3_FINAL"] = platt_bt.predict_proba(out[["RankScore"]].values)[:, 1]
+    out = out.sort_values("RankScore", ascending=False).reset_index(drop=True)
+    out.insert(0, "Rank", np.arange(1, len(out) + 1))
+
+    # Columnas de retorno real (next-week) si existen en el df
+    if RET_REAL_COL and RET_REAL_COL in scoring_df.columns:
+        out["Ret_Real_NextWeek"] = scoring_df[RET_REAL_COL].values
+    else:
+        out["Ret_Real_NextWeek"] = np.nan
+
+    # SPY benchmark para esta fecha
+    spy_row = scoring_df[scoring_df[TICK_COL] == "SPY"]
+    if len(spy_row) and RET_REAL_COL and RET_REAL_COL in spy_row.columns:
+        spy_ret_val = float(pd.to_numeric(spy_row[RET_REAL_COL], errors="coerce").mean())
+    else:
+        spy_ret_val = np.nan
+    out["SPY_Ret_NextWeek"] = spy_ret_val
+
+    if np.isnan(spy_ret_val):
+        out["Beat_SPY"] = np.nan
+    else:
+        out["Beat_SPY"] = (out["Ret_Real_NextWeek"] > spy_ret_val).astype(float)
+        out.loc[out["Ret_Real_NextWeek"].isna(), "Beat_SPY"] = np.nan
+
+    return out.head(TOP_K)
+
+
+def run_backtest_loop(
+    df_all: pd.DataFrame,
+    feature_cols: list,
+    universe_mask_col: str,
+    run_label: str,
+    out_file: Path,
+) -> dict:
+    """
+    Loopea BACKTEST_DATES, llama a run_single_backtest por cada fecha,
+    consolida en un Excel con una sheet por fecha + Summary + Config.
+
+    Tras el primer run imprime estimación de tiempo. Si > BACKTEST_MAX_HOURS_AUTO horas,
+    pide confirmación (input con timeout de 30 s; si no hay respuesta, continúa).
+
+    Retorna dict de métricas por fecha.
+    """
+    import sys, select
+
+    print(f"\n{'='*80}")
+    print(f"BACKTEST WALK-FORWARD: {run_label}  |  universe: {universe_mask_col}")
+    print(f"  Fechas: {len(BACKTEST_DATES)}  |  Output: {out_file.name}")
+    print("=" * 80)
+
+    # Normalizar BACKTEST_DATES a Timestamps (mismo mecanismo que _DateKey)
+    bt_timestamps = {
+        raw: pd.Timestamp(raw).to_period("W").end_time.normalize()
+        for raw in BACKTEST_DATES
+    }
+
+    # Verificar cuántas fechas matchean
+    available_dates = set(df_all["_DateKey"].dropna().unique())
+    missing = [raw for raw, ts in bt_timestamps.items() if ts not in available_dates]
+    if len(missing) > 2:
+        print(f"\n  *** ALERTA: {len(missing)} fechas del backtest NO matchean en _DateKey:")
+        for m in missing:
+            print(f"      {m} → normalizado: {bt_timestamps[m].date()}")
+        print("  Verificar normalización de fechas antes de continuar.")
+    elif missing:
+        print(f"  [WARN] {len(missing)} fecha(s) sin match en _DateKey: {[bt_timestamps[m].date() for m in missing]}")
+
+    results: Dict[str, pd.DataFrame] = {}
+    summary_rows = []
+    first_elapsed = None
+    total_to_run = len(BACKTEST_DATES)
+
+    for i, raw_date in enumerate(BACKTEST_DATES, 1):
+        anchor_ts = bt_timestamps[raw_date]
+        t0 = time.time()
+
+        top20 = run_single_backtest(
+            df_all=df_all,
+            anchor_date=anchor_ts,
+            feature_cols=feature_cols,
+            universe_mask_col=universe_mask_col,
+            run_label=run_label,
+        )
+        elapsed = time.time() - t0
+
+        if top20 is None:
+            print(f"[BT {run_label}] {i:02d}/{total_to_run}  anchor={anchor_ts.date()}  → SKIPPED")
+            continue
+
+        results[raw_date] = top20
+
+        # Métricas compactas para el log
+        n_univ = int(df_all[
+            (df_all["_DateKey"] == anchor_ts) & df_all[universe_mask_col].fillna(False)
+        ].shape[0])
+        cutoff = anchor_ts - pd.Timedelta(weeks=1)
+        n_train = int(df_all[
+            (df_all["_DateKey"] <= cutoff) & df_all[universe_mask_col].fillna(False) & df_all["y_t3"].notna()
+        ].shape[0])
+
+        avg_score  = float(top20["RankScore"].mean())
+        avg_ret    = float(top20["Ret_Real_NextWeek"].mean()) if top20["Ret_Real_NextWeek"].notna().any() else np.nan
+        spy_ret    = float(top20["SPY_Ret_NextWeek"].iloc[0]) if pd.notna(top20["SPY_Ret_NextWeek"].iloc[0]) else np.nan
+        beat_n     = int(top20["Beat_SPY"].sum()) if top20["Beat_SPY"].notna().any() else 0
+        top1_tick  = top20.iloc[0][TICK_COL]
+        top1_score = float(top20.iloc[0]["Prob_T3_FINAL"])
+
+        avg_ret_str = f"{avg_ret:+.1%}" if not np.isnan(avg_ret) else "N/A"
+        spy_str     = f"{spy_ret:+.1%}" if not np.isnan(spy_ret) else "N/A"
+        beat_str    = f"{beat_n}/{TOP_K}" if top20["Beat_SPY"].notna().any() else "N/A"
+
+        print(f"[BT {run_label}] {i:02d}/{total_to_run}  anchor={anchor_ts.date()}  "
+              f"univ={n_univ:,}  train={n_train:,}  fit={elapsed:.1f}s")
+        print(f"              top1={top1_tick}({top1_score:.2f})  "
+              f"top20_ret={avg_ret_str}  spy={spy_str}  beat_spy={beat_str}")
+
+        # Estimación de tiempo tras el primer run
+        if first_elapsed is None:
+            first_elapsed = elapsed
+            total_est_h = (first_elapsed * total_to_run) / 3600.0
+            print(f"\n  Tiempo del primer backtest single: {first_elapsed:.1f} s")
+            print(f"  Estimación total backtest: {total_to_run} corridas × {first_elapsed:.1f} s "
+                  f"≈ {total_est_h:.1f} horas")
+            if total_est_h > BACKTEST_MAX_HOURS_AUTO:
+                print(f"  Estimación > {BACKTEST_MAX_HOURS_AUTO} h. ¿Procedo con el backtest completo? (y/n) "
+                      f"[30 s para responder, default=y] ", end="", flush=True)
+                try:
+                    rdy, _, _ = select.select([sys.stdin], [], [], 30)
+                    ans = sys.stdin.readline().strip().lower() if rdy else ""
+                except Exception:
+                    ans = ""
+                if ans == "n":
+                    print("\n  Backtest abortado por el usuario.")
+                    break
+                else:
+                    print("\n  Continuando..." if ans else "\n  Sin respuesta en 30 s → continuando...")
+
+        # Acumular para summary
+        p20_realized = float(top20["y_t3"].mean()) if "y_t3" in top20.columns else np.nan
+        best_ticker = top20.sort_values("Ret_Real_NextWeek", ascending=False).iloc[0][TICK_COL] \
+            if top20["Ret_Real_NextWeek"].notna().any() else "N/A"
+        worst_ticker = top20.sort_values("Ret_Real_NextWeek", ascending=True).iloc[0][TICK_COL] \
+            if top20["Ret_Real_NextWeek"].notna().any() else "N/A"
+        hit_rate = float(top20["Beat_SPY"].mean()) if top20["Beat_SPY"].notna().any() else np.nan
+
+        summary_rows.append({
+            "Anchor_Date":      raw_date,
+            "N_Universe":       n_univ,
+            "Top20_AvgScore":   round(avg_score, 4),
+            "Top20_AvgRet":     round(avg_ret, 4) if not np.isnan(avg_ret) else np.nan,
+            "SPY_Ret":          round(spy_ret, 4) if not np.isnan(spy_ret) else np.nan,
+            "HitRate_vs_SPY":   round(hit_rate, 4) if not np.isnan(hit_rate) else np.nan,
+            "P@20_realized":    round(p20_realized, 4) if not np.isnan(p20_realized) else np.nan,
+            "Best_Ticker":      best_ticker,
+            "Worst_Ticker":     worst_ticker,
+            "Fit_Time_s":       round(elapsed, 1),
+        })
+
+    # ── Summary print ────────────────────────────────────────────
+    summary_df   = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame()
+    processed    = len(results)
+
+    print(f"\n=== BACKTEST SUMMARY: {run_label} ===")
+    print(f"Fechas procesadas        : {processed}")
+
+    if not summary_df.empty:
+        avg_p20     = summary_df["P@20_realized"].mean()
+        avg_top_ret = summary_df["Top20_AvgRet"].mean()
+        avg_spy_ret = summary_df["SPY_Ret"].mean()
+        avg_hit     = summary_df["HitRate_vs_SPY"].mean()
+
+        print(f"Avg P@20 realizado       : {avg_p20:.3f}" if not np.isnan(avg_p20) else "Avg P@20 realizado       : N/A")
+        print(f"Avg Top20 next-week ret  : {avg_top_ret:+.2%}" if not np.isnan(avg_top_ret) else "Avg Top20 next-week ret  : N/A")
+        print(f"Avg SPY next-week ret    : {avg_spy_ret:+.2%}" if not np.isnan(avg_spy_ret) else "Avg SPY next-week ret    : N/A")
+        print(f"Avg HitRate vs SPY       : {avg_hit:.0%}" if not np.isnan(avg_hit) else "Avg HitRate vs SPY       : N/A")
+
+        # Mejor / peor semana
+        ret_col_s = summary_df["Top20_AvgRet"].dropna()
+        if len(ret_col_s):
+            best_idx  = ret_col_s.idxmax()
+            worst_idx = ret_col_s.idxmin()
+            bd = summary_df.loc[best_idx,  "Anchor_Date"]
+            br = summary_df.loc[best_idx,  "Top20_AvgRet"]
+            bs = summary_df.loc[best_idx,  "SPY_Ret"]
+            wd = summary_df.loc[worst_idx, "Anchor_Date"]
+            wr = summary_df.loc[worst_idx, "Top20_AvgRet"]
+            ws = summary_df.loc[worst_idx, "SPY_Ret"]
+            print(f"Mejor semana             : {bd} (top20={br:+.1%} vs spy={bs:+.1%})")
+            print(f"Peor semana              : {wd} (top20={wr:+.1%} vs spy={ws:+.1%})")
+
+    print(f"Excel: {out_file}")
+
+    # ── Export Excel ──────────────────────────────────────────────
+    if results:
+        config_df = pd.DataFrame({
+            "Parametro": [
+                "run_label", "universe_mask_col", "BACKTEST_DATES",
+                "TOP_K", "N_FOLDS", "EMBARGO_DATES", "HOLDOUT_N_WEEKS",
+                "SEED", "INPUT_HASH", "DATE_STAMP",
+                "UNIV_MIN_CLOSE", "UNIV_MIN_DOLLAR_VOL_20D", "UNIV_MAX_ZERO_RET_PCT_60D",
+            ],
+            "Valor": [
+                run_label, universe_mask_col, ", ".join(BACKTEST_DATES),
+                TOP_K, N_FOLDS, EMBARGO_DATES, HOLDOUT_N_WEEKS,
+                SEED, INPUT_HASH, DATE_STAMP,
+                UNIV_MIN_CLOSE, UNIV_MIN_DOLLAR_VOL_20D, UNIV_MAX_ZERO_RET_PCT_60D,
+            ],
+        })
+        with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
+            for raw_date, top20 in results.items():
+                sheet_name = raw_date[:10]  # "YYYY-MM-DD" (10 chars, válido para Excel)
+                top20.to_excel(writer, sheet_name=sheet_name, index=False)
+            if not summary_df.empty:
+                summary_df.to_excel(writer, sheet_name="Summary", index=False)
+            config_df.to_excel(writer, sheet_name="Config", index=False)
+        print(f"[BT {run_label}] Exportado: {out_file}")
+    else:
+        print(f"[BT {run_label}] Sin resultados: Excel no generado.")
+
+    return {r["Anchor_Date"]: r for r in summary_rows}
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║                         EXECUTION                               ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
@@ -1210,6 +1641,66 @@ ho_new, fi_new, m_new, p20w_new = run_pipeline(
     out_file=OUT_FILE_NEW,
     run_label="NEW_FULL",
 )
+
+
+# ════════ BACKTEST WALK-FORWARD ════════
+bt_base = run_backtest_loop(
+    df_all=df,
+    feature_cols=feature_cols_base,
+    universe_mask_col="_univ_close5",
+    run_label="BACKTEST_BASELINE",
+    out_file=OUT_FILE_BT_BASELINE,
+)
+
+bt_abl = run_backtest_loop(
+    df_all=df,
+    feature_cols=feature_cols_base,
+    universe_mask_col="_univ_pass",
+    run_label="BACKTEST_ABLATION",
+    out_file=OUT_FILE_BT_ABLATION,
+)
+
+bt_new = run_backtest_loop(
+    df_all=df,
+    feature_cols=feature_cols_new,
+    universe_mask_col="_univ_pass",
+    run_label="BACKTEST_NEW",
+    out_file=OUT_FILE_BT_NEW,
+)
+
+# ── Tabla comparativa de backtest ────────────────────────────────
+def _bt_avg(bt_dict, key):
+    vals = [v[key] for v in bt_dict.values() if isinstance(v.get(key), float) and not np.isnan(v[key])]
+    return float(np.mean(vals)) if vals else np.nan
+
+def _bt_best_worst(bt_dict):
+    rows = [(v["Anchor_Date"], v["Top20_AvgRet"]) for v in bt_dict.values()
+            if isinstance(v.get("Top20_AvgRet"), float) and not np.isnan(v["Top20_AvgRet"])]
+    if not rows:
+        return "N/A", "N/A"
+    best  = max(rows, key=lambda x: x[1])
+    worst = min(rows, key=lambda x: x[1])
+    return f"{best[0]}({best[1]:+.1%})", f"{worst[0]}({worst[1]:+.1%})"
+
+print(f"\n\n{'='*80}")
+print("=== COMPARATIVA FINAL BACKTEST ===")
+print(f"{'='*80}")
+
+_hdr = f"  {'Variante':<20} {'Avg P@20':>9} {'Avg Top20 Ret':>14} {'Avg HitRate vs SPY':>19} {'Mejor sem':>22} {'Peor sem':>22}"
+print(_hdr)
+print("  " + "-" * (len(_hdr) - 2))
+
+for lbl, bt_d in [("BASELINE", bt_base), ("ABLATION", bt_abl), ("NEW", bt_new)]:
+    ap20  = _bt_avg(bt_d, "P@20_realized")
+    aret  = _bt_avg(bt_d, "Top20_AvgRet")
+    ahit  = _bt_avg(bt_d, "HitRate_vs_SPY")
+    best_s, worst_s = _bt_best_worst(bt_d)
+    ap20_s = f"{ap20:.3f}" if not np.isnan(ap20) else " N/A "
+    aret_s = f"{aret:+.2%}" if not np.isnan(aret) else "   N/A  "
+    ahit_s = f"{ahit:.0%}"  if not np.isnan(ahit) else "  N/A  "
+    print(f"  {lbl:<20} {ap20_s:>9} {aret_s:>14} {ahit_s:>19} {best_s:>22} {worst_s:>22}")
+
+print()
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
