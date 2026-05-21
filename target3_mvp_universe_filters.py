@@ -1312,15 +1312,15 @@ def run_single_backtest(
         print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: sin OOF válidas.")
         return None
 
-    y_oof = train_df.loc[valid, "y_t3_int"].values
+    y_oof  = train_df.loc[valid, "y_t3_int"].values
     df_oof = train_df.loc[valid, ["_DateKey"]].copy()
-    df_oof["RankScore"] = (
-        float(np.median(fold_weights) if fold_weights else W_CLF_INIT) * oof_clf[valid]
-        + (1.0 - float(np.median(fold_weights) if fold_weights else W_CLF_INIT))
-        * pd.Series(oof_rnk[valid]).groupby(train_df.loc[valid, "_DateKey"]).rank(pct=True).values
-    )
+    df_oof["Prob_Clf"]     = oof_clf[valid]      # índice original de train_df
+    df_oof["Score_Ranker"] = oof_rnk[valid]      # ídem → alineación correcta
+    df_oof["RankerPct"]    = df_oof.groupby("_DateKey")["Score_Ranker"].rank(pct=True)
+
     W_CLF_bt = float(np.median(fold_weights)) if fold_weights else W_CLF_INIT
     W_RNK_bt = 1.0 - W_CLF_bt
+    df_oof["RankScore"] = W_CLF_bt * df_oof["Prob_Clf"] + W_RNK_bt * df_oof["RankerPct"]
 
     # Platt calibration en OOF
     platt_bt = LogisticRegression(max_iter=2000, random_state=SEED)
