@@ -343,8 +343,9 @@ def compute_universe_masks(df, tick_col, price_col, ret_col="_ret_w_tmp"):
     # Filter 1: Close > $5
     df["_univ_close5"] = price > UNIV_MIN_CLOSE
 
-    # Find volume column
-    vol_col = next((c for c in VOL_COL_CANDIDATES if c in df.columns), None)
+    # Buscar volumen raw; fallback a Vol_Rel_20 (Volume/20d-mean) si no está
+    vol_col     = next((c for c in VOL_COL_CANDIDATES if c in df.columns), None)
+    vol_rel_col = "Vol_Rel_20" if "Vol_Rel_20" in df.columns else None
 
     # Filter 2: Dollar_Volume_20d > $5M
     if vol_col:
@@ -355,8 +356,20 @@ def compute_universe_masks(df, tick_col, price_col, ret_col="_ret_w_tmp"):
             .transform(lambda x: x.rolling(4, min_periods=2).mean())
         )
         df["_univ_dvol"] = df["Dollar_Volume_20d"] > UNIV_MIN_DOLLAR_VOL_20D
+    elif vol_rel_col:
+        # Vol_Rel_20 = Volume / Volume.rolling(20).mean()  (ya computado en datos)
+        # Proxy: Close * Vol_Rel_20 es proporcional al dollar volume relativo.
+        # Threshold ajustado: > 0.5 ≈ volumen al menos 50% del promedio histórico.
+        print("  [WARN] Sin Volume raw: usando Vol_Rel_20 > 0.5 como proxy de liquidez.")
+        vr = pd.to_numeric(df[vol_rel_col], errors="coerce").replace(0, np.nan)
+        dv_proxy = price * vr
+        df["Dollar_Volume_20d"] = (
+            dv_proxy.groupby(df[tick_col])
+            .transform(lambda x: x.rolling(4, min_periods=2).mean())
+        )
+        df["_univ_dvol"] = df["Dollar_Volume_20d"] > 0.5
     else:
-        print("  [WARN] Sin columna de volumen: filtro Dollar_Volume_20d desactivado.")
+        print("  [WARN] Sin Volume ni Vol_Rel_20: filtro Dollar_Volume_20d desactivado.")
         df["Dollar_Volume_20d"] = np.nan
         df["_univ_dvol"] = True
 
@@ -422,8 +435,24 @@ def compute_illiquidity_momentum_features(df, tick_col, date_col, price_col, ret
         nan_pct = df["Amihud_ILLIQ_20d"].isna().mean()
         print(f"       NaN: {nan_pct:.1%}")
     else:
-        df["Amihud_ILLIQ_20d"] = np.nan
-        print("       [WARN] Sin volumen: Amihud_ILLIQ_20d = NaN 100%")
+        vol_rel_col = "Vol_Rel_20" if "Vol_Rel_20" in df.columns else None
+        if vol_rel_col:
+            vr = pd.to_numeric(df[vol_rel_col], errors="coerce").replace(0, np.nan)
+            # Vol_Rel_20 = Volume / Volume.rolling(20).mean()  → proxy relativo de liquidez
+            illiq_raw = ret_w.abs() / (price * vr)
+            df["Amihud_ILLIQ_20d"] = (
+                illiq_raw.groupby(df[tick_col])
+                .transform(lambda x: x.rolling(4, min_periods=2).mean())
+            )
+            df["Amihud_ILLIQ_20d"] = np.log1p(df["Amihud_ILLIQ_20d"])
+            df["Amihud_ILLIQ_20d"] = df.groupby(date_col)["Amihud_ILLIQ_20d"].transform(
+                lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99))
+            )
+            nan_pct = df["Amihud_ILLIQ_20d"].isna().mean()
+            print(f"       [WARN] Sin Volume raw: usando Vol_Rel_20 como proxy. NaN: {nan_pct:.1%}")
+        else:
+            df["Amihud_ILLIQ_20d"] = np.nan
+            print("       [WARN] Sin Volume ni Vol_Rel_20: Amihud_ILLIQ_20d = NaN 100%")
 
     # ── 2) MAX5_21d_neg ──────────────────────────────────────────
     # Cita: Bali, Cakici & Whitelaw (2011, JFE)
@@ -438,8 +467,9 @@ def compute_illiquidity_momentum_features(df, tick_col, date_col, price_col, ret
         return -1.0 * np.sort(valid)[-n_top:].mean()
 
     # Guardamos ret_w en columna temporal para el rolling apply groupby
+    # Clip retornos extremos: <-99% son errores de datos (penny stocks), >1000% idem
     _tmp_col = "__ret_w_tmp_max5"
-    df[_tmp_col] = ret_w.values
+    df[_tmp_col] = ret_w.clip(lower=-0.99, upper=10.0).values
 
     df["MAX5_21d_neg"] = (
         df.groupby(tick_col)[_tmp_col]
@@ -491,7 +521,7 @@ def compute_illiquidity_momentum_features(df, tick_col, date_col, price_col, ret
     new_features = [
         "Amihud_ILLIQ_20d",
         "MAX5_21d_neg",
-        "Ratio_52w_High",
+        # Ratio_52w_High removida: corr=0.98 con Drawdown_52w existente (redundante)
         "Information_Discreteness_12M",
     ]
 
