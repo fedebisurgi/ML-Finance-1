@@ -51,6 +51,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from scipy.stats import spearmanr
 from typing import List, Tuple, Optional, Dict, Any
 
 import lightgbm as lgb
@@ -254,6 +255,13 @@ def permutation_test_p_at_k(df_pred, date_col, y_true_col, score_col, k=20, n_pe
         )
     perm_scores = np.array(perm_scores)
     return observed, float(np.mean(perm_scores)), float(np.mean(perm_scores >= observed))
+
+
+def _isnan_safe(v) -> bool:
+    try:
+        return bool(np.isnan(float(v)))
+    except (TypeError, ValueError):
+        return True
 
 
 def safe_median_best(iters, default_val):
@@ -1193,6 +1201,109 @@ def run_pipeline(
 # ║              BACKTEST WALK-FORWARD (v6.0)                       ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
+def _compute_attribution_metrics(
+    scored_df: pd.DataFrame,
+    spy_ret_val: float,
+    anchor_date: pd.Timestamp,
+) -> dict:
+    """
+    Métricas de atribución calculadas sobre el universo COMPLETO rankeado,
+    ANTES de cortar Top-K. scored_df debe tener RankScore y Ret_Real_NextWeek
+    en su índice original (sin reset_index, sin sort previo).
+
+    Métricas:
+      spearman        : corr Spearman(RankScore, Ret_Real_NextWeek) — KPI skill ranking
+      decile_spread   : ret promedio decil 10 − decil 1 (>0 = modelo discrimina)
+      top{1,3,5,10,20}_ret : equal-weight por concentración de posición
+      top20_lw_ret    : linear-weighted (pesos ∝ 21-rank, normalizados)
+      top3_beat_spy / top10_beat_spy : hit-rate vs SPY
+    """
+    def _r(v):
+        try:
+            fv = float(v)
+            return round(fv, 4) if np.isfinite(fv) else np.nan
+        except (TypeError, ValueError):
+            return np.nan
+
+    rs  = scored_df["RankScore"].values.astype(float)
+    ret = pd.to_numeric(scored_df.get("Ret_Real_NextWeek", pd.Series(dtype=float)),
+                        errors="coerce").values.astype(float)
+
+    valid = np.isfinite(rs) & np.isfinite(ret)
+    n_valid = int(valid.sum())
+    rs_v, ret_v = rs[valid], ret[valid]
+
+    # 1) Spearman
+    if n_valid >= 20:
+        spearman = float(spearmanr(rs_v, ret_v).correlation)
+    else:
+        spearman = np.nan
+
+    # 2) Decile spread (sobre subconjunto válido)
+    decile_top_ret = decile_bot_ret = decile_spread = np.nan
+    if n_valid >= 20:
+        try:
+            labels = pd.qcut(pd.Series(rs_v), 10, labels=False, duplicates="drop")
+            groups = pd.Series(ret_v).groupby(labels).mean()
+            if len(groups) >= 2:
+                decile_top_ret = float(groups.iloc[-1])
+                decile_bot_ret = float(groups.iloc[0])
+                decile_spread  = decile_top_ret - decile_bot_ret
+        except Exception:
+            pass
+
+    # 3) Position-sized returns (ordenar por RankScore desc, incluyendo NaN-ret)
+    sort_idx   = np.argsort(-rs)          # orden descendente por score
+    ret_sorted = ret[sort_idx]            # retornos en ese orden
+
+    def _topn(n):
+        sub = ret_sorted[:n]
+        sub = sub[np.isfinite(sub)]
+        return float(np.mean(sub)) if len(sub) else np.nan
+
+    top1_ret  = _topn(1)
+    top3_ret  = _topn(3)
+    top5_ret  = _topn(5)
+    top10_ret = _topn(10)
+    top20_ret = _topn(20)
+
+    # Linear-weighted Top-20: w ∝ 21 − rank (rank 1 = peso mayor), normalizados
+    sub20    = ret_sorted[:20]
+    w_lw     = np.arange(20, 0, -1, dtype=float)
+    valid_lw = np.isfinite(sub20)
+    if valid_lw.any():
+        w = w_lw[valid_lw]; w = w / w.sum()
+        top20_lw_ret = float(np.dot(sub20[valid_lw], w))
+    else:
+        top20_lw_ret = np.nan
+
+    # 4) Hit rate vs SPY para top-3 y top-10
+    def _beat_spy(n):
+        if np.isnan(spy_ret_val):
+            return np.nan
+        sub = ret_sorted[:n]
+        sub = sub[np.isfinite(sub)]
+        return float(np.mean(sub > spy_ret_val)) if len(sub) else np.nan
+
+    return {
+        "Anchor_Date":    str(anchor_date.date()),
+        "n_valid":        n_valid,
+        "spearman":       _r(spearman),
+        "decile_top_ret": _r(decile_top_ret),
+        "decile_bot_ret": _r(decile_bot_ret),
+        "decile_spread":  _r(decile_spread),
+        "top1_ret":       _r(top1_ret),
+        "top3_ret":       _r(top3_ret),
+        "top5_ret":       _r(top5_ret),
+        "top10_ret":      _r(top10_ret),
+        "top20_ret":      _r(top20_ret),
+        "top20_lw_ret":   _r(top20_lw_ret),
+        "top3_beat_spy":  _r(_beat_spy(3)),
+        "top10_beat_spy": _r(_beat_spy(10)),
+        "spy_ret":        _r(spy_ret_val),
+    }
+
+
 def run_single_backtest(
     df_all: pd.DataFrame,
     anchor_date: pd.Timestamp,
@@ -1220,7 +1331,7 @@ def run_single_backtest(
     scoring_df = df_filt[df_filt["_DateKey"] == anchor_date].copy()
     if len(scoring_df) == 0:
         print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: fecha no existe en _DateKey.")
-        return None
+        return None, {}
     if len(scoring_df) < 50:
         print(f"  [BT {run_label}] anchor={anchor_date.date()} → WARNING: universo={len(scoring_df)} < 50 tickers.")
 
@@ -1238,7 +1349,7 @@ def run_single_backtest(
 
     if len(train_df) < 2000:
         print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: train muy pequeño ({len(train_df)} rows).")
-        return None
+        return None, {}
 
     unique_dates = sorted(train_df["_DateKey"].unique())
     splits = make_walkforward_splits(
@@ -1246,7 +1357,7 @@ def run_single_backtest(
     )
     if not splits:
         print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: sin splits walk-forward.")
-        return None
+        return None, {}
 
     oof_clf = np.full(len(train_df), np.nan)
     oof_rnk = np.full(len(train_df), np.nan)
@@ -1310,7 +1421,7 @@ def run_single_backtest(
     valid = np.isfinite(oof_clf) & np.isfinite(oof_rnk)
     if valid.sum() == 0:
         print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: sin OOF válidas.")
-        return None
+        return None, {}
 
     y_oof  = train_df.loc[valid, "y_t3_int"].values
     df_oof = train_df.loc[valid, ["_DateKey"]].copy()
@@ -1365,17 +1476,17 @@ def run_single_backtest(
 
     if len(scoring_df) == 0:
         print(f"  [BT {run_label}] anchor={anchor_date.date()} → SKIP: scoring vacío tras NaN filter.")
-        return None
+        return None, {}
 
     X_sc = imp_final.transform(scoring_df[feature_cols].replace([np.inf, -np.inf], np.nan))
     p_sc = clf_final.predict_proba(X_sc)[:, 1]
 
-    sc_s = scoring_df.sort_values(TICK_COL)
+    sc_s  = scoring_df.sort_values(TICK_COL)
     X_sc_r = imp_final.transform(sc_s[feature_cols].replace([np.inf, -np.inf], np.nan))
     s_sc_r = rnk_final.predict(X_sc_r)
     s_sc_aligned = pd.Series(s_sc_r, index=sc_s.index).loc[scoring_df.index].values
 
-    # Incluir y_t3 para calcular P@20_realized en summary (NaN si aún no disponible)
+    # Construir out con índice original (igual que scoring_df) — NO se resetea todavía
     _extra_cols = [c for c in [TICK_COL, PRICE_COL, "y_t3"] if c in scoring_df.columns]
     out = scoring_df[_extra_cols].copy()
     out["Prob_Clf"]      = p_sc
@@ -1383,30 +1494,39 @@ def run_single_backtest(
     out["RankerPct"]     = out["Score_Ranker"].rank(pct=True)
     out["RankScore"]     = W_CLF_bt * out["Prob_Clf"] + W_RNK_bt * out["RankerPct"]
     out["Prob_T3_FINAL"] = platt_bt.predict_proba(out[["RankScore"]].values)[:, 1]
-    out = out.sort_values("RankScore", ascending=False).reset_index(drop=True)
-    out.insert(0, "Rank", np.arange(1, len(out) + 1))
 
-    # Columnas de retorno real (next-week) si existen en el df
+    # Retorno real: join por índice ANTES de ordenar (evita desalineación post-reset_index)
     if RET_REAL_COL and RET_REAL_COL in scoring_df.columns:
-        out["Ret_Real_NextWeek"] = scoring_df[RET_REAL_COL].values
+        out["Ret_Real_NextWeek"] = pd.to_numeric(scoring_df[RET_REAL_COL], errors="coerce")
     else:
         out["Ret_Real_NextWeek"] = np.nan
 
-    # SPY benchmark para esta fecha
-    spy_row = scoring_df[scoring_df[TICK_COL] == "SPY"]
-    if len(spy_row) and RET_REAL_COL and RET_REAL_COL in spy_row.columns:
-        spy_ret_val = float(pd.to_numeric(spy_row[RET_REAL_COL], errors="coerce").mean())
+    # SPY benchmark: escalar — loguear si hay variación intra-fecha inesperada
+    spy_mask = scoring_df[TICK_COL] == "SPY"
+    if spy_mask.any() and RET_REAL_COL and RET_REAL_COL in scoring_df.columns:
+        spy_rets_raw = pd.to_numeric(scoring_df.loc[spy_mask, RET_REAL_COL], errors="coerce")
+        if spy_rets_raw.nunique() > 1:
+            print(f"  [WARN] SPY_Ret varía dentro de anchor={anchor_date.date()}: "
+                  f"{spy_rets_raw.nunique()} valores distintos.")
+        spy_ret_val = float(spy_rets_raw.mean())
     else:
         spy_ret_val = np.nan
+
     out["SPY_Ret_NextWeek"] = spy_ret_val
+    out["Beat_SPY"] = np.nan if np.isnan(spy_ret_val) else (
+        (out["Ret_Real_NextWeek"] > spy_ret_val)
+        .where(out["Ret_Real_NextWeek"].notna())
+        .astype(float)
+    )
 
-    if np.isnan(spy_ret_val):
-        out["Beat_SPY"] = np.nan
-    else:
-        out["Beat_SPY"] = (out["Ret_Real_NextWeek"] > spy_ret_val).astype(float)
-        out.loc[out["Ret_Real_NextWeek"].isna(), "Beat_SPY"] = np.nan
+    # ── Attribution metrics sobre universo COMPLETO (antes de cortar Top-K) ──
+    attr = _compute_attribution_metrics(out, spy_ret_val, anchor_date)
 
-    return out.head(TOP_K)
+    # Ahora sí: ordenar y exponer rank
+    out = out.sort_values("RankScore", ascending=False).reset_index(drop=True)
+    out.insert(0, "Rank", np.arange(1, len(out) + 1))
+
+    return out.head(TOP_K), attr
 
 
 def run_backtest_loop(
@@ -1451,6 +1571,7 @@ def run_backtest_loop(
 
     results: Dict[str, pd.DataFrame] = {}
     summary_rows = []
+    attribution_rows: list = []
     first_elapsed = None
     total_to_run = len(BACKTEST_DATES)
 
@@ -1458,7 +1579,7 @@ def run_backtest_loop(
         anchor_ts = bt_timestamps[raw_date]
         t0 = time.time()
 
-        top20 = run_single_backtest(
+        top20, attr = run_single_backtest(
             df_all=df_all,
             anchor_date=anchor_ts,
             feature_cols=feature_cols,
@@ -1472,6 +1593,8 @@ def run_backtest_loop(
             continue
 
         results[raw_date] = top20
+        if attr:
+            attribution_rows.append(attr)
 
         # Métricas compactas para el log
         n_univ = int(df_all[
@@ -1488,6 +1611,7 @@ def run_backtest_loop(
         beat_n     = int(top20["Beat_SPY"].sum()) if top20["Beat_SPY"].notna().any() else 0
         top1_tick  = top20.iloc[0][TICK_COL]
         top1_score = float(top20.iloc[0]["Prob_T3_FINAL"])
+        spr_str    = f"{attr['spearman']:+.3f}" if attr and not _isnan_safe(attr.get("spearman")) else "N/A"
 
         avg_ret_str = f"{avg_ret:+.1%}" if not np.isnan(avg_ret) else "N/A"
         spy_str     = f"{spy_ret:+.1%}" if not np.isnan(spy_ret) else "N/A"
@@ -1495,8 +1619,8 @@ def run_backtest_loop(
 
         print(f"[BT {run_label}] {i:02d}/{total_to_run}  anchor={anchor_ts.date()}  "
               f"univ={n_univ:,}  train={n_train:,}  fit={elapsed:.1f}s")
-        print(f"              top1={top1_tick}({top1_score:.2f})  "
-              f"top20_ret={avg_ret_str}  spy={spy_str}  beat_spy={beat_str}")
+        print(f"              top1={top1_tick}({top1_score:.2f})  top20_ret={avg_ret_str}  "
+              f"spy={spy_str}  beat_spy={beat_str}  spearman={spr_str}")
 
         # Estimación de tiempo tras el primer run
         if first_elapsed is None:
@@ -1541,8 +1665,9 @@ def run_backtest_loop(
         })
 
     # ── Summary print ────────────────────────────────────────────
-    summary_df   = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame()
-    processed    = len(results)
+    summary_df    = pd.DataFrame(summary_rows)    if summary_rows    else pd.DataFrame()
+    attribution_df = pd.DataFrame(attribution_rows) if attribution_rows else pd.DataFrame()
+    processed     = len(results)
 
     print(f"\n=== BACKTEST SUMMARY: {run_label} ===")
     print(f"Fechas procesadas        : {processed}")
@@ -1553,12 +1678,11 @@ def run_backtest_loop(
         avg_spy_ret = summary_df["SPY_Ret"].mean()
         avg_hit     = summary_df["HitRate_vs_SPY"].mean()
 
-        print(f"Avg P@20 realizado       : {avg_p20:.3f}" if not np.isnan(avg_p20) else "Avg P@20 realizado       : N/A")
-        print(f"Avg Top20 next-week ret  : {avg_top_ret:+.2%}" if not np.isnan(avg_top_ret) else "Avg Top20 next-week ret  : N/A")
-        print(f"Avg SPY next-week ret    : {avg_spy_ret:+.2%}" if not np.isnan(avg_spy_ret) else "Avg SPY next-week ret    : N/A")
-        print(f"Avg HitRate vs SPY       : {avg_hit:.0%}" if not np.isnan(avg_hit) else "Avg HitRate vs SPY       : N/A")
+        print(f"Avg P@20 realizado       : {avg_p20:.3f}" if not _isnan_safe(avg_p20) else "Avg P@20 realizado       : N/A")
+        print(f"Avg Top20 next-week ret  : {avg_top_ret:+.2%}" if not _isnan_safe(avg_top_ret) else "Avg Top20 next-week ret  : N/A")
+        print(f"Avg SPY next-week ret    : {avg_spy_ret:+.2%}" if not _isnan_safe(avg_spy_ret) else "Avg SPY next-week ret    : N/A")
+        print(f"Avg HitRate vs SPY       : {avg_hit:.0%}" if not _isnan_safe(avg_hit) else "Avg HitRate vs SPY       : N/A")
 
-        # Mejor / peor semana
         ret_col_s = summary_df["Top20_AvgRet"].dropna()
         if len(ret_col_s):
             best_idx  = ret_col_s.idxmax()
@@ -1571,6 +1695,41 @@ def run_backtest_loop(
             ws = summary_df.loc[worst_idx, "SPY_Ret"]
             print(f"Mejor semana             : {bd} (top20={br:+.1%} vs spy={bs:+.1%})")
             print(f"Peor semana              : {wd} (top20={wr:+.1%} vs spy={ws:+.1%})")
+
+    # ── Attribution aggregations ─────────────────────────────────
+    def _col_mean(df, col):
+        if df.empty or col not in df.columns:
+            return np.nan
+        return float(df[col].mean(skipna=True))
+
+    attr_agg = {}
+    if not attribution_df.empty:
+        spr = attribution_df["spearman"].dropna()
+        attr_agg = {
+            "spearman_mean":      _col_mean(attribution_df, "spearman"),
+            "spearman_median":    float(spr.median()) if len(spr) else np.nan,
+            "spearman_pct_pos":   float((spr > 0).mean()) if len(spr) else np.nan,
+            "decile_spread_mean": _col_mean(attribution_df, "decile_spread"),
+            "top3_mean":          _col_mean(attribution_df, "top3_ret"),
+            "top20_mean":         _col_mean(attribution_df, "top20_ret"),
+        }
+        t3   = attribution_df["top3_ret"].dropna()
+        t20  = attribution_df["top20_ret"].dropna()
+        common_idx = t3.index.intersection(t20.index)
+        attr_agg["top3_minus_top20"] = float((t3.loc[common_idx] - t20.loc[common_idx]).mean()) \
+            if len(common_idx) else np.nan
+
+        def _pct(v): return f"{v:.1%}" if not _isnan_safe(v) else "N/A"
+        def _flt(v): return f"{v:+.4f}" if not _isnan_safe(v) else "N/A"
+
+        print(f"\n  === Attribution (universo completo) ===")
+        print(f"  spearman_mean       : {_flt(attr_agg['spearman_mean'])}")
+        print(f"  spearman_median     : {_flt(attr_agg['spearman_median'])}")
+        print(f"  spearman_pct_pos    : {_pct(attr_agg['spearman_pct_pos'])}")
+        print(f"  decile_spread_mean  : {_pct(attr_agg['decile_spread_mean'])}")
+        print(f"  top3_mean           : {_pct(attr_agg['top3_mean'])}")
+        print(f"  top20_mean          : {_pct(attr_agg['top20_mean'])}")
+        print(f"  top3_minus_top20    : {_pct(attr_agg['top3_minus_top20'])}  ← KPI concentración")
 
     print(f"Excel: {out_file}")
 
@@ -1590,12 +1749,25 @@ def run_backtest_loop(
                 UNIV_MIN_CLOSE, UNIV_MIN_DOLLAR_VOL_20D, UNIV_MAX_ZERO_RET_PCT_60D,
             ],
         })
+
+        # Agregar agregados de Attribution al final del Summary
+        if attr_agg and not summary_df.empty:
+            agg_rows = pd.DataFrame([{
+                "Anchor_Date": "=== ATTRIBUTION AGGREGATES ===",
+                **{k: v for k, v in attr_agg.items()},
+            }])
+            summary_export = pd.concat([summary_df, agg_rows], ignore_index=True)
+        else:
+            summary_export = summary_df
+
         with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
             for raw_date, top20 in results.items():
-                sheet_name = raw_date[:10]  # "YYYY-MM-DD" (10 chars, válido para Excel)
+                sheet_name = raw_date[:10]
                 top20.to_excel(writer, sheet_name=sheet_name, index=False)
-            if not summary_df.empty:
-                summary_df.to_excel(writer, sheet_name="Summary", index=False)
+            if not summary_export.empty:
+                summary_export.to_excel(writer, sheet_name="Summary", index=False)
+            if not attribution_df.empty:
+                attribution_df.to_excel(writer, sheet_name="Attribution", index=False)
             config_df.to_excel(writer, sheet_name="Config", index=False)
         print(f"[BT {run_label}] Exportado: {out_file}")
     else:
