@@ -41,6 +41,18 @@ NUEVO en v5.0  (feat/universe-filters-mvp)
   5. Diagnósticos FASE 0-6 impresos al final.
 """
 
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                  *** DEPRECATED ***                             ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# Este script monolítico fue dividido en target3_core.py + entry points.
+# Sigue funcionando idénticamente durante 1 semana de sprint de deprecación;
+# será eliminado después. Usar:
+#   - python target3_predict.py    para Top-20 semanal productivo
+#   - python target3_backtest.py   para validación walk-forward histórica
+print("[DEPRECATED] target3_mvp_universe_filters.py — este script será eliminado.")
+print("             Usar target3_predict.py (semanal) o target3_backtest.py (validación).")
+print()
+
 import warnings
 warnings.filterwarnings("ignore")
 
