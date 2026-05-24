@@ -1,57 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-target3_mvp_universe_filters.py  —  v5.0 (MVP: universe filters + 4 illiq/momentum features)
-==============================================================================================
+target3_core.py  —  módulo compartido para predict y backtest
 
-CONSOLIDATION NOTES
--------------------
-Script A  (v2.4 / Predicciones_Target3_SUPERADOR_v2_4.py) — contribuciones:
-  - Estructura fundacional: load -> features -> walk-forward -> blend -> score -> export
-  - Diseño de run_pipeline() y formato de export Excel
-  - apply_price_filter() helper
-  DESCARTADO de A: walk-forward con folds solapados (corregido en v3+), embargo=1
-  (insuficiente para features multi-semana), búsqueda de pesos sobre OOF completo
-  (look-ahead vs. búsqueda anidada por fold), relevancia binaria {0,2} para ranker.
+CONTENIDO
+---------
+  - Configuración (paths, hiperparámetros, fechas backtest default).
+  - Helpers (walk-forward, métricas, builders LGBM, etc.).
+  - compute_universe_masks, compute_illiquidity_momentum_features.
+  - load_and_prepare_data() → PipelineContext.
+  - run_pipeline (entrenamiento + holdout scoring + score último cierre).
+  - run_single_backtest, run_backtest_loop, _compute_attribution_metrics.
 
-Script B  (v3.0 pegado + Pred_T3_v4.py del repo) — mejoras adoptadas:
-  - make_walkforward_splits no-solapado (FIX A2): evita reuso de fechas de val entre folds.
-  - EMBARGO_DATES=4: conservador; requerido dado lookback multi-semana de features.
-  - compute_relevance_labels() multi-nivel 0-3 (FIX B1): señal más rica para LambdaRank.
-  - gap_aware_shift() (FIX C2): evita conectar semanas no adyacentes.
-  - compute_input_hash() (FIX E3): reproducibilidad / versionado de archivos.
-  - permutation_test_p_at_k() (FIX D3): validez estadística del P@K.
-  - run_pipeline() retorna dict de métricas: habilita tabla comparativa multi-run.
-  - Feature importance con guard de dedup (v4): evita crash por cols duplicadas en Excel.
-  - Bottom-K candidatos short (v4): útil para señales de salida.
-  DESCARTADO de B para este MVP: USE_STACKING (complejidad no justificada en MVP),
-  SCORE_SMOOTHING (no hay run previo), USE_DYNAMIC_TOPK (K fijo más limpio para
-  comparación), market_regime (depende de SPY, agrega ruido en validación rápida),
-  sector_neutralise (opcional, off por defecto para no confundir el A/B).
+USO
+---
+  from target3_core import load_and_prepare_data, run_pipeline, ...
+  ctx = load_and_prepare_data()
+  run_pipeline(ctx.df, ctx.feature_cols_base, ...)
 
-NUEVO en v5.0  (feat/universe-filters-mvp)
--------------------------------------------
-  1. Filtros de universo post-FE, pre-entrenamiento, por fecha, sin leakage:
-       Close > $5  |  Dollar_Volume_20d > $5M  |  Zero_Return_Days_Pct_60d < 20%
-  2. Cuatro features nuevas (solo OHLCV, sin fuentes externas):
-       Amihud_ILLIQ_20d, MAX5_21d_neg, Ratio_52w_High, Information_Discreteness_12M
-       Cada una + variante cross-sectional __rank por fecha.
-  3. Holdout propio: últimas HOLDOUT_N_WEEKS fechas reservadas, nunca en entrenamiento.
-  4. Triple pipeline: BASELINE (features viejas + filtro precio) | ABLATION (viejas +
-     filtros universo) | NEW (viejas + filtros universo + 4 features nuevas).
-  5. Diagnósticos FASE 0-6 impresos al final.
+NO ejecutar este módulo directamente. Usar:
+  - target3_predict.py   para Top-20 semanal productivo
+  - target3_backtest.py  para validación walk-forward histórica
 """
-
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                  *** DEPRECATED ***                             ║
-# ╚══════════════════════════════════════════════════════════════════╝
-# Este script monolítico fue dividido en target3_core.py + entry points.
-# Sigue funcionando idénticamente durante 1 semana de sprint de deprecación;
-# será eliminado después. Usar:
-#   - python target3_predict.py    para Top-20 semanal productivo
-#   - python target3_backtest.py   para validación walk-forward histórica
-print("[DEPRECATED] target3_mvp_universe_filters.py — este script será eliminado.")
-print("             Usar target3_predict.py (semanal) o target3_backtest.py (validación).")
-print()
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -64,7 +33,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from scipy.stats import spearmanr
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, NamedTuple
 
 import lightgbm as lgb
 from lightgbm import LGBMClassifier, LGBMRanker
@@ -573,208 +542,242 @@ def compute_illiquidity_momentum_features(df, tick_col, date_col, price_col, ret
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║                   1) LOAD + NORMALISE                           ║
+# ║         LOAD + FEATURE ENGINEERING + HOLDOUT SPLIT              ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-print(f"Input hash: {INPUT_HASH}")
-df = pd.read_excel(FILE_PATH)
-print(f"Datos cargados: {df.shape}")
-
-df.columns = [clean_colname(c) for c in df.columns]
-
-# Dedup columnas (v4 fix)
-if df.columns.duplicated().any():
-    dup = df.columns[df.columns.duplicated(keep=False)].unique().tolist()
-    print(f"  [WARN] Columnas duplicadas eliminadas (keep=first): {dup}")
-    df = df.loc[:, ~df.columns.duplicated(keep="first")]
-
-TICK_COL  = "Ticker"
-DATE_COL  = "Data_Date"
-PRICE_COL = "Close" if "Close" in df.columns else ("Precio" if "Precio" in df.columns else None)
-if PRICE_COL is None:
-    raise KeyError("No encuentro columna Close ni Precio.")
-
-YCOL = "Target3" if "Target3" in df.columns else None
-if YCOL is None:
-    raise KeyError("No encuentro columna Target3.")
-
-SECTOR_COL = "Sector" if "Sector" in df.columns else None
-
-BASELINE_COL = (
-    "Predicted_Outperform_Prob"
-    if "Predicted_Outperform_Prob" in df.columns
-    else None
-)
-
-for c in [TICK_COL, DATE_COL, PRICE_COL, YCOL]:
-    if c not in df.columns:
-        raise KeyError(f"Falta columna '{c}'.")
-
-df[TICK_COL] = df[TICK_COL].astype(str).str.upper().str.strip()
-df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
-# Normalizar a viernes de cada semana para evitar mezcla intra-semana (FIX C3)
-df["_DateKey"] = df[DATE_COL].dt.to_period("W").dt.end_time.dt.normalize()
-
-df = ensure_numeric(df, [PRICE_COL, YCOL])
-df[YCOL] = df[YCOL].apply(lambda x: np.nan if pd.isna(x) else (1 if float(x) >= 0.5 else 0))
-df["y_t3"] = df[YCOL].astype(float)
-
-# Columna de retorno real para métricas de evaluación (no usada como feature)
-RET_REAL_COL = next(
-    (c for c in ["Ret_Una_sem", "Ret_1w_real", "Ret_Una_Semana"] if c in df.columns),
-    None,
-)
-if RET_REAL_COL:
-    df[RET_REAL_COL] = pd.to_numeric(df[RET_REAL_COL], errors="coerce")
-    print(f"  [OK] Columna de retorno real para métricas: '{RET_REAL_COL}'")
-
-df = df.sort_values([TICK_COL, DATE_COL]).reset_index(drop=True)
-
-print("\n--- Date Consistency Diagnostic ---")
-diagnose_date_consistency(df, TICK_COL, DATE_COL)
+# Constantes runtime — pobladas por load_and_prepare_data().
+# Las funciones run_pipeline / run_single_backtest las leen como globales del módulo
+# (alternativa a pasarlas por parámetro a cada función).
+TICK_COL: Optional[str]      = None
+DATE_COL: Optional[str]      = None
+PRICE_COL: Optional[str]     = None
+YCOL: Optional[str]          = None
+SECTOR_COL: Optional[str]    = None
+BASELINE_COL: Optional[str]  = None
+RET_REAL_COL: Optional[str]  = None
+GLOBAL_ANCHOR_DATE: Optional[pd.Timestamp] = None
+HOLDOUT_DATES: set           = set()
+TRAIN_DATES_POOL: set        = set()
+HOLDOUT_N_WEEKS_ACTUAL: int  = HOLDOUT_N_WEEKS
 
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                      2) FEATURE ENGINEERING                     ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
-leak_cols = set([
-    "Precio_una_semana", "Ret_Una_sem", "Target", "Target_real",
-    "Predicted_Outperform_Prob", "Ret_Next", "Next_Week_Return",
-    "Forward_Return", "Target1", "Target2", "Target4", "Target5",
-])
-
-candidates = [
-    "ADX_14", "ATRp_14", "Aroon_Diff_25", "CCI_20_0_015",
-    "Consecutive_Volume_Growth", "Cross_Signal",
-    "Days_since_Death", "Days_since_Golden", "Drawdown_52w",
-    "FIB_Range_90D", "MACD_Hist_Slope_5", "MACDh_12_26_9",
-    "MA_SLOPE_20", "MFI_14", "OBV_trend", "PctB",
-    "Pct_in_52w_range", "RET_1M", "RET_3M", "RET_6M",
-    "RS1M_SPY", "RS3M_SPY", "RS6M_SPY",
-    "RSI_14", "Ret13_Ratio", "SMA_200", "SMA_50",
-    "STOCH_Cross", "VROC_14", "Vol_Rel_20", "Vol_StreakUp",
-    "MA50_over_MA200", "Close_over_MA200", "Price_gt_MA200",
-    "Trend_Score", "Momentum_Score", "RelStr_Score", "RiskPos_Score",
-    "Setup_Tag", "NearHigh_NoVol", "ScoreSimple", "Ret_Ultimos_dias",
-    "SPY_RET_1M", "SPY_RET_3M", "SPY_RET_6M", "SPY_Ret",
-    "Min", "Max",
-]
-base_features = [c for c in candidates if c in df.columns and c not in leak_cols]
-df = ensure_numeric(df, base_features)
-
-# FE gap-aware desde Close (FIX C2)
-df["Close_prev"]   = gap_aware_shift(df, TICK_COL, "_DateKey", PRICE_COL, 1, 2)
-df["Ret_1w_calc"]  = (df[PRICE_COL] / df["Close_prev"]) - 1.0
-df["LogRet_1w"]    = np.log(df[PRICE_COL] / df["Close_prev"])
-df["GapPct"]       = df["Ret_1w_calc"].copy()
-df["GapPct"]       = df["GapPct"].replace([np.inf, -np.inf], np.nan)
-
-df["Vol_12w"] = (
-    df.groupby(TICK_COL)["LogRet_1w"]
-    .rolling(12, min_periods=6)
-    .std()
-    .reset_index(0, drop=True)
-)
-
-eps = 1e-6
-for c in ["RET_3M", "RET_6M"]:
-    if c not in df.columns:
-        df[c] = np.nan
-df = ensure_numeric(df, ["RET_3M", "RET_6M"])
-df["RiskAdjMom_3M"] = df["RET_3M"] / (df["Vol_12w"] + eps)
-df["RiskAdjMom_6M"] = df["RET_6M"] / (df["Vol_12w"] + eps)
-
-# Short-term: momentum aceleración y price/4w-high (de v4)
-df["Ret_1w_prev"]   = gap_aware_shift(df, TICK_COL, "_DateKey", "Ret_1w_calc", 1, 2)
-df["MomAccel_1w"]   = df["Ret_1w_calc"] - df["Ret_1w_prev"]
-df["High_4w"]       = df.groupby(TICK_COL)[PRICE_COL].transform(
-    lambda x: x.rolling(4, min_periods=2).max()
-)
-df["PriceToHigh4w"] = df[PRICE_COL] / df["High_4w"].replace(0, np.nan)
-df.drop(columns=["Ret_1w_prev", "High_4w"], inplace=True)
-
-vol_col_found = next((c for c in VOL_COL_CANDIDATES if c in df.columns), None)
-if vol_col_found:
-    df[vol_col_found] = pd.to_numeric(df[vol_col_found], errors="coerce")
-    vm = df.groupby(TICK_COL)[vol_col_found].transform(lambda x: x.rolling(8, min_periods=4).mean())
-    vs = df.groupby(TICK_COL)[vol_col_found].transform(lambda x: x.rolling(8, min_periods=4).std())
-    df["VolZScore_8w"] = (df[vol_col_found] - vm) / vs.replace(0, np.nan)
-else:
-    df["VolZScore_8w"] = np.nan
-
-short_term_cols = ["MomAccel_1w", "PriceToHigh4w", "VolZScore_8w"]
-
-fe_new = ["GapPct", "Ret_1w_calc", "Vol_12w", "RiskAdjMom_3M", "RiskAdjMom_6M"]
-df = ensure_numeric(df, fe_new + short_term_cols)
-
-# Cross-sectional ranks — BASE
-xs_pick_base = [c for c in [
-    "RET_1M", "RET_3M", "RET_6M",
-    "RS1M_SPY", "RS3M_SPY", "RS6M_SPY",
-    "Momentum_Score", "RelStr_Score",
-    "RiskAdjMom_3M", "RiskAdjMom_6M",
-    "Vol_Rel_20", "Drawdown_52w", "GapPct", "Vol_12w",
-    "MomAccel_1w", "PriceToHigh4w",
-] if c in df.columns]
-
-xs_rank_cols_base = []
-for c in xs_pick_base[:25]:
-    rcol = f"{c}__rank"
-    df[rcol] = df.groupby("_DateKey")[c].rank(pct=True)
-    xs_rank_cols_base.append(rcol)
-
-# Lista de features BASE (sin features nuevas)
-_all_base = base_features + fe_new + short_term_cols + xs_rank_cols_base
-feature_cols_base = [c for c in _all_base if c in df.columns and c not in leak_cols]
-feature_cols_base = list(dict.fromkeys(feature_cols_base))
-
-print(f"\nFeatures BASE: {len(feature_cols_base)}")
-
-# ── Filtros de universo ──────────────────────────────────────────
-print("\n--- Computando filtros de universo ---")
-df = compute_universe_masks(df, TICK_COL, PRICE_COL, ret_col="Ret_1w_calc")
-
-# ── 4 features nuevas ────────────────────────────────────────────
-print("\n--- Computando 4 features nuevas ---")
-t0_fe = time.time()
-df, new_raw_features, new_rank_features = compute_illiquidity_momentum_features(
-    df, TICK_COL, "_DateKey", PRICE_COL, ret_1w_col="Ret_1w_calc"
-)
-print(f"  Tiempo: {time.time() - t0_fe:.1f}s")
-
-# Lista de features NEW (base + 4 nuevas + sus ranks)
-feature_cols_new = list(dict.fromkeys(
-    feature_cols_base + new_raw_features + new_rank_features
-))
-feature_cols_new = [c for c in feature_cols_new if c in df.columns and c not in leak_cols]
-
-print(f"Features BASE: {len(feature_cols_base)}")
-print(f"Features NEW : {len(feature_cols_new)}")
+class PipelineContext(NamedTuple):
+    df: pd.DataFrame
+    feature_cols_base: List[str]
+    feature_cols_new: List[str]
+    train_dates_pool: set
+    holdout_dates: set
+    anchor_date: pd.Timestamp
+    new_raw_features: List[str]
+    new_rank_features: List[str]
 
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║               ANCHOR DATE + HOLDOUT SPLIT                       ║
-# ╚══════════════════════════════════════════════════════════════════╝
+def load_and_prepare_data(file_path: Optional[Path] = None) -> PipelineContext:
+    """
+    Carga el dataset, normaliza columnas, computa features y separa holdout.
 
-last_dates = df.dropna(subset=["_DateKey"]).groupby(TICK_COL)["_DateKey"].max()
-anchor_cands = last_dates.value_counts()
-GLOBAL_ANCHOR_DATE = anchor_cands.index[0]
-print(f"\nAnchor global: {GLOBAL_ANCHOR_DATE.date()} "
-      f"(coverage: {anchor_cands.iloc[0]/len(last_dates):.1%} de tickers)")
+    Idempotente: dos llamadas con el mismo input producen el mismo PipelineContext
+    (y dejan las constantes runtime — TICK_COL, RET_REAL_COL, TRAIN_DATES_POOL,
+    etc. — pobladas en globals() del módulo). Las funciones run_pipeline /
+    run_single_backtest las leen desde ahí.
+    """
+    global TICK_COL, DATE_COL, PRICE_COL, YCOL, SECTOR_COL, BASELINE_COL, RET_REAL_COL
+    global GLOBAL_ANCHOR_DATE, HOLDOUT_DATES, TRAIN_DATES_POOL, HOLDOUT_N_WEEKS_ACTUAL
 
-all_unique_dates = sorted(df["_DateKey"].dropna().unique())
-if len(all_unique_dates) <= HOLDOUT_N_WEEKS + N_FOLDS * 3:
-    HOLDOUT_N_WEEKS_ACTUAL = max(5, len(all_unique_dates) // 5)
-    print(f"  [WARN] Pocos fechas; ajustando holdout a {HOLDOUT_N_WEEKS_ACTUAL} semanas.")
-else:
-    HOLDOUT_N_WEEKS_ACTUAL = HOLDOUT_N_WEEKS
+    fp = file_path or FILE_PATH
 
-HOLDOUT_DATES     = set(all_unique_dates[-HOLDOUT_N_WEEKS_ACTUAL:])
-TRAIN_DATES_POOL  = set(all_unique_dates[:-HOLDOUT_N_WEEKS_ACTUAL])
-print(f"Holdout: {HOLDOUT_N_WEEKS_ACTUAL} fechas ({min(HOLDOUT_DATES).date()} "
-      f"→ {max(HOLDOUT_DATES).date()})")
-print(f"Train pool: {len(TRAIN_DATES_POOL)} fechas")
+    print(f"Input hash: {INPUT_HASH}")
+    df = pd.read_excel(fp)
+    print(f"Datos cargados: {df.shape}")
+
+    df.columns = [clean_colname(c) for c in df.columns]
+
+    # Dedup columnas (v4 fix)
+    if df.columns.duplicated().any():
+        dup = df.columns[df.columns.duplicated(keep=False)].unique().tolist()
+        print(f"  [WARN] Columnas duplicadas eliminadas (keep=first): {dup}")
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+    TICK_COL  = "Ticker"
+    DATE_COL  = "Data_Date"
+    PRICE_COL = "Close" if "Close" in df.columns else ("Precio" if "Precio" in df.columns else None)
+    if PRICE_COL is None:
+        raise KeyError("No encuentro columna Close ni Precio.")
+
+    YCOL = "Target3" if "Target3" in df.columns else None
+    if YCOL is None:
+        raise KeyError("No encuentro columna Target3.")
+
+    SECTOR_COL = "Sector" if "Sector" in df.columns else None
+
+    BASELINE_COL = (
+        "Predicted_Outperform_Prob"
+        if "Predicted_Outperform_Prob" in df.columns
+        else None
+    )
+
+    for c in [TICK_COL, DATE_COL, PRICE_COL, YCOL]:
+        if c not in df.columns:
+            raise KeyError(f"Falta columna '{c}'.")
+
+    df[TICK_COL] = df[TICK_COL].astype(str).str.upper().str.strip()
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    df["_DateKey"] = df[DATE_COL].dt.to_period("W").dt.end_time.dt.normalize()
+
+    df = ensure_numeric(df, [PRICE_COL, YCOL])
+    df[YCOL] = df[YCOL].apply(lambda x: np.nan if pd.isna(x) else (1 if float(x) >= 0.5 else 0))
+    df["y_t3"] = df[YCOL].astype(float)
+
+    RET_REAL_COL = next(
+        (c for c in ["Ret_Una_sem", "Ret_1w_real", "Ret_Una_Semana"] if c in df.columns),
+        None,
+    )
+    if RET_REAL_COL:
+        df[RET_REAL_COL] = pd.to_numeric(df[RET_REAL_COL], errors="coerce")
+        print(f"  [OK] Columna de retorno real para métricas: '{RET_REAL_COL}'")
+
+    df = df.sort_values([TICK_COL, DATE_COL]).reset_index(drop=True)
+
+    print("\n--- Date Consistency Diagnostic ---")
+    diagnose_date_consistency(df, TICK_COL, DATE_COL)
+
+    # ── FEATURE ENGINEERING ──────────────────────────────────────────
+    leak_cols = set([
+        "Precio_una_semana", "Ret_Una_sem", "Target", "Target_real",
+        "Predicted_Outperform_Prob", "Ret_Next", "Next_Week_Return",
+        "Forward_Return", "Target1", "Target2", "Target4", "Target5",
+    ])
+
+    candidates = [
+        "ADX_14", "ATRp_14", "Aroon_Diff_25", "CCI_20_0_015",
+        "Consecutive_Volume_Growth", "Cross_Signal",
+        "Days_since_Death", "Days_since_Golden", "Drawdown_52w",
+        "FIB_Range_90D", "MACD_Hist_Slope_5", "MACDh_12_26_9",
+        "MA_SLOPE_20", "MFI_14", "OBV_trend", "PctB",
+        "Pct_in_52w_range", "RET_1M", "RET_3M", "RET_6M",
+        "RS1M_SPY", "RS3M_SPY", "RS6M_SPY",
+        "RSI_14", "Ret13_Ratio", "SMA_200", "SMA_50",
+        "STOCH_Cross", "VROC_14", "Vol_Rel_20", "Vol_StreakUp",
+        "MA50_over_MA200", "Close_over_MA200", "Price_gt_MA200",
+        "Trend_Score", "Momentum_Score", "RelStr_Score", "RiskPos_Score",
+        "Setup_Tag", "NearHigh_NoVol", "ScoreSimple", "Ret_Ultimos_dias",
+        "SPY_RET_1M", "SPY_RET_3M", "SPY_RET_6M", "SPY_Ret",
+        "Min", "Max",
+    ]
+    base_features = [c for c in candidates if c in df.columns and c not in leak_cols]
+    df = ensure_numeric(df, base_features)
+
+    df["Close_prev"]   = gap_aware_shift(df, TICK_COL, "_DateKey", PRICE_COL, 1, 2)
+    df["Ret_1w_calc"]  = (df[PRICE_COL] / df["Close_prev"]) - 1.0
+    df["LogRet_1w"]    = np.log(df[PRICE_COL] / df["Close_prev"])
+    df["GapPct"]       = df["Ret_1w_calc"].copy()
+    df["GapPct"]       = df["GapPct"].replace([np.inf, -np.inf], np.nan)
+
+    df["Vol_12w"] = (
+        df.groupby(TICK_COL)["LogRet_1w"]
+        .rolling(12, min_periods=6)
+        .std()
+        .reset_index(0, drop=True)
+    )
+
+    eps = 1e-6
+    for c in ["RET_3M", "RET_6M"]:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = ensure_numeric(df, ["RET_3M", "RET_6M"])
+    df["RiskAdjMom_3M"] = df["RET_3M"] / (df["Vol_12w"] + eps)
+    df["RiskAdjMom_6M"] = df["RET_6M"] / (df["Vol_12w"] + eps)
+
+    df["Ret_1w_prev"]   = gap_aware_shift(df, TICK_COL, "_DateKey", "Ret_1w_calc", 1, 2)
+    df["MomAccel_1w"]   = df["Ret_1w_calc"] - df["Ret_1w_prev"]
+    df["High_4w"]       = df.groupby(TICK_COL)[PRICE_COL].transform(
+        lambda x: x.rolling(4, min_periods=2).max()
+    )
+    df["PriceToHigh4w"] = df[PRICE_COL] / df["High_4w"].replace(0, np.nan)
+    df.drop(columns=["Ret_1w_prev", "High_4w"], inplace=True)
+
+    vol_col_found = next((c for c in VOL_COL_CANDIDATES if c in df.columns), None)
+    if vol_col_found:
+        df[vol_col_found] = pd.to_numeric(df[vol_col_found], errors="coerce")
+        vm = df.groupby(TICK_COL)[vol_col_found].transform(lambda x: x.rolling(8, min_periods=4).mean())
+        vs = df.groupby(TICK_COL)[vol_col_found].transform(lambda x: x.rolling(8, min_periods=4).std())
+        df["VolZScore_8w"] = (df[vol_col_found] - vm) / vs.replace(0, np.nan)
+    else:
+        df["VolZScore_8w"] = np.nan
+
+    short_term_cols = ["MomAccel_1w", "PriceToHigh4w", "VolZScore_8w"]
+    fe_new = ["GapPct", "Ret_1w_calc", "Vol_12w", "RiskAdjMom_3M", "RiskAdjMom_6M"]
+    df = ensure_numeric(df, fe_new + short_term_cols)
+
+    xs_pick_base = [c for c in [
+        "RET_1M", "RET_3M", "RET_6M",
+        "RS1M_SPY", "RS3M_SPY", "RS6M_SPY",
+        "Momentum_Score", "RelStr_Score",
+        "RiskAdjMom_3M", "RiskAdjMom_6M",
+        "Vol_Rel_20", "Drawdown_52w", "GapPct", "Vol_12w",
+        "MomAccel_1w", "PriceToHigh4w",
+    ] if c in df.columns]
+
+    xs_rank_cols_base = []
+    for c in xs_pick_base[:25]:
+        rcol = f"{c}__rank"
+        df[rcol] = df.groupby("_DateKey")[c].rank(pct=True)
+        xs_rank_cols_base.append(rcol)
+
+    _all_base = base_features + fe_new + short_term_cols + xs_rank_cols_base
+    feature_cols_base = [c for c in _all_base if c in df.columns and c not in leak_cols]
+    feature_cols_base = list(dict.fromkeys(feature_cols_base))
+
+    print(f"\nFeatures BASE: {len(feature_cols_base)}")
+
+    print("\n--- Computando filtros de universo ---")
+    df = compute_universe_masks(df, TICK_COL, PRICE_COL, ret_col="Ret_1w_calc")
+
+    print("\n--- Computando 4 features nuevas ---")
+    t0_fe = time.time()
+    df, new_raw_features, new_rank_features = compute_illiquidity_momentum_features(
+        df, TICK_COL, "_DateKey", PRICE_COL, ret_1w_col="Ret_1w_calc"
+    )
+    print(f"  Tiempo: {time.time() - t0_fe:.1f}s")
+
+    feature_cols_new = list(dict.fromkeys(
+        feature_cols_base + new_raw_features + new_rank_features
+    ))
+    feature_cols_new = [c for c in feature_cols_new if c in df.columns and c not in leak_cols]
+
+    print(f"Features BASE: {len(feature_cols_base)}")
+    print(f"Features NEW : {len(feature_cols_new)}")
+
+    # ── ANCHOR DATE + HOLDOUT SPLIT ──────────────────────────────────
+    last_dates = df.dropna(subset=["_DateKey"]).groupby(TICK_COL)["_DateKey"].max()
+    anchor_cands = last_dates.value_counts()
+    GLOBAL_ANCHOR_DATE = anchor_cands.index[0]
+    print(f"\nAnchor global: {GLOBAL_ANCHOR_DATE.date()} "
+          f"(coverage: {anchor_cands.iloc[0]/len(last_dates):.1%} de tickers)")
+
+    all_unique_dates = sorted(df["_DateKey"].dropna().unique())
+    if len(all_unique_dates) <= HOLDOUT_N_WEEKS + N_FOLDS * 3:
+        HOLDOUT_N_WEEKS_ACTUAL = max(5, len(all_unique_dates) // 5)
+        print(f"  [WARN] Pocos fechas; ajustando holdout a {HOLDOUT_N_WEEKS_ACTUAL} semanas.")
+    else:
+        HOLDOUT_N_WEEKS_ACTUAL = HOLDOUT_N_WEEKS
+
+    HOLDOUT_DATES    = set(all_unique_dates[-HOLDOUT_N_WEEKS_ACTUAL:])
+    TRAIN_DATES_POOL = set(all_unique_dates[:-HOLDOUT_N_WEEKS_ACTUAL])
+    print(f"Holdout: {HOLDOUT_N_WEEKS_ACTUAL} fechas ({min(HOLDOUT_DATES).date()} "
+          f"→ {max(HOLDOUT_DATES).date()})")
+    print(f"Train pool: {len(TRAIN_DATES_POOL)} fechas")
+
+    return PipelineContext(
+        df=df,
+        feature_cols_base=feature_cols_base,
+        feature_cols_new=feature_cols_new,
+        train_dates_pool=TRAIN_DATES_POOL,
+        holdout_dates=HOLDOUT_DATES,
+        anchor_date=GLOBAL_ANCHOR_DATE,
+        new_raw_features=new_raw_features,
+        new_rank_features=new_rank_features,
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1547,10 +1550,12 @@ def run_backtest_loop(
     universe_mask_col: str,
     run_label: str,
     out_file: Path,
+    backtest_dates: Optional[List[str]] = None,
 ) -> dict:
     """
-    Loopea BACKTEST_DATES, llama a run_single_backtest por cada fecha,
-    consolida en un Excel con una sheet por fecha + Summary + Config.
+    Loopea backtest_dates (o BACKTEST_DATES del módulo si no se pasa),
+    llama a run_single_backtest por cada fecha, consolida en un Excel con una
+    sheet por fecha + Summary + Attribution + Config.
 
     Tras el primer run imprime estimación de tiempo. Si > BACKTEST_MAX_HOURS_AUTO horas,
     pide confirmación (input con timeout de 30 s; si no hay respuesta, continúa).
@@ -1559,15 +1564,17 @@ def run_backtest_loop(
     """
     import sys, select
 
+    dates = backtest_dates if backtest_dates is not None else BACKTEST_DATES
+
     print(f"\n{'='*80}")
     print(f"BACKTEST WALK-FORWARD: {run_label}  |  universe: {universe_mask_col}")
-    print(f"  Fechas: {len(BACKTEST_DATES)}  |  Output: {out_file.name}")
+    print(f"  Fechas: {len(dates)}  |  Output: {out_file.name}")
     print("=" * 80)
 
-    # Normalizar BACKTEST_DATES a Timestamps (mismo mecanismo que _DateKey)
+    # Normalizar fechas a Timestamps (mismo mecanismo que _DateKey)
     bt_timestamps = {
         raw: pd.Timestamp(raw).to_period("W").end_time.normalize()
-        for raw in BACKTEST_DATES
+        for raw in dates
     }
 
     # Verificar cuántas fechas matchean
@@ -1585,9 +1592,9 @@ def run_backtest_loop(
     summary_rows = []
     attribution_rows: list = []
     first_elapsed = None
-    total_to_run = len(BACKTEST_DATES)
+    total_to_run = len(dates)
 
-    for i, raw_date in enumerate(BACKTEST_DATES, 1):
+    for i, raw_date in enumerate(dates, 1):
         anchor_ts = bt_timestamps[raw_date]
         t0 = time.time()
 
@@ -1755,7 +1762,7 @@ def run_backtest_loop(
                 "UNIV_MIN_CLOSE", "UNIV_MIN_DOLLAR_VOL_20D", "UNIV_MAX_ZERO_RET_PCT_60D",
             ],
             "Valor": [
-                run_label, universe_mask_col, ", ".join(BACKTEST_DATES),
+                run_label, universe_mask_col, ", ".join(dates),
                 TOP_K, N_FOLDS, EMBARGO_DATES, HOLDOUT_N_WEEKS,
                 SEED, INPUT_HASH, DATE_STAMP,
                 UNIV_MIN_CLOSE, UNIV_MIN_DOLLAR_VOL_20D, UNIV_MAX_ZERO_RET_PCT_60D,
@@ -1786,372 +1793,3 @@ def run_backtest_loop(
         print(f"[BT {run_label}] Sin resultados: Excel no generado.")
 
     return {r["Anchor_Date"]: r for r in summary_rows}
-
-
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║                         EXECUTION                               ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
-print("\n" + "=" * 80)
-print("PIPELINE v5.0 — MVP Universe Filters")
-print(f"  Run 1 BASELINE : features base, filtro Close>$5")
-print(f"  Run 2 ABLATION : features base, filtros universo completos")
-print(f"  Run 3 NEW      : features base + 4 nuevas, filtros universo")
-print("=" * 80)
-
-# RUN 1: BASELINE
-ho_base, fi_base, m_base, p20w_base = run_pipeline(
-    df_all=df,
-    feature_cols=feature_cols_base,
-    universe_mask_col="_univ_close5",
-    out_file=OUT_FILE_BASELINE,
-    run_label="BASELINE",
-)
-
-# RUN 2: ABLATION (filtros nuevos, features viejas)
-ho_abl, fi_abl, m_abl, p20w_abl = run_pipeline(
-    df_all=df,
-    feature_cols=feature_cols_base,
-    universe_mask_col="_univ_pass",
-    out_file=OUT_FILE_ABLATION,
-    run_label="ABLATION_FILTERS",
-)
-
-# RUN 3: NEW (filtros nuevos + 4 features nuevas)
-ho_new, fi_new, m_new, p20w_new = run_pipeline(
-    df_all=df,
-    feature_cols=feature_cols_new,
-    universe_mask_col="_univ_pass",
-    out_file=OUT_FILE_NEW,
-    run_label="NEW_FULL",
-)
-
-
-# ════════ BACKTEST WALK-FORWARD ════════
-bt_base = run_backtest_loop(
-    df_all=df,
-    feature_cols=feature_cols_base,
-    universe_mask_col="_univ_close5",
-    run_label="BACKTEST_BASELINE",
-    out_file=OUT_FILE_BT_BASELINE,
-)
-
-bt_abl = run_backtest_loop(
-    df_all=df,
-    feature_cols=feature_cols_base,
-    universe_mask_col="_univ_pass",
-    run_label="BACKTEST_ABLATION",
-    out_file=OUT_FILE_BT_ABLATION,
-)
-
-bt_new = run_backtest_loop(
-    df_all=df,
-    feature_cols=feature_cols_new,
-    universe_mask_col="_univ_pass",
-    run_label="BACKTEST_NEW",
-    out_file=OUT_FILE_BT_NEW,
-)
-
-# ── Tabla comparativa de backtest ────────────────────────────────
-def _bt_avg(bt_dict, key):
-    vals = [v[key] for v in bt_dict.values() if isinstance(v.get(key), float) and not np.isnan(v[key])]
-    return float(np.mean(vals)) if vals else np.nan
-
-def _bt_best_worst(bt_dict):
-    rows = [(v["Anchor_Date"], v["Top20_AvgRet"]) for v in bt_dict.values()
-            if isinstance(v.get("Top20_AvgRet"), float) and not np.isnan(v["Top20_AvgRet"])]
-    if not rows:
-        return "N/A", "N/A"
-    best  = max(rows, key=lambda x: x[1])
-    worst = min(rows, key=lambda x: x[1])
-    return f"{best[0]}({best[1]:+.1%})", f"{worst[0]}({worst[1]:+.1%})"
-
-print(f"\n\n{'='*80}")
-print("=== COMPARATIVA FINAL BACKTEST ===")
-print(f"{'='*80}")
-
-_hdr = f"  {'Variante':<20} {'Avg P@20':>9} {'Avg Top20 Ret':>14} {'Avg HitRate vs SPY':>19} {'Mejor sem':>22} {'Peor sem':>22}"
-print(_hdr)
-print("  " + "-" * (len(_hdr) - 2))
-
-for lbl, bt_d in [("BASELINE", bt_base), ("ABLATION", bt_abl), ("NEW", bt_new)]:
-    ap20  = _bt_avg(bt_d, "P@20_realized")
-    aret  = _bt_avg(bt_d, "Top20_AvgRet")
-    ahit  = _bt_avg(bt_d, "HitRate_vs_SPY")
-    best_s, worst_s = _bt_best_worst(bt_d)
-    ap20_s = f"{ap20:.3f}" if not np.isnan(ap20) else " N/A "
-    aret_s = f"{aret:+.2%}" if not np.isnan(aret) else "   N/A  "
-    ahit_s = f"{ahit:.0%}"  if not np.isnan(ahit) else "  N/A  "
-    print(f"  {lbl:<20} {ap20_s:>9} {aret_s:>14} {ahit_s:>19} {best_s:>22} {worst_s:>22}")
-
-print()
-
-
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║               DIAGNOSTICS — FASE 0 a FASE 6                    ║
-# ╚══════════════════════════════════════════════════════════════════╝
-
-SEP = "=" * 70
-
-# ── FASE 0: UNIVERSO ─────────────────────────────────────────────
-print(f"\n\n{SEP}")
-print("=== FASE 0: UNIVERSO ===")
-print(SEP)
-
-total_tickers_orig = df[TICK_COL].nunique()
-n_after_close5     = df[df["_univ_close5"].fillna(False)][TICK_COL].nunique()
-n_after_dvol       = df[df["_univ_close5"].fillna(False) & df["_univ_dvol"].fillna(False)][TICK_COL].nunique()
-n_after_all        = df[df["_univ_pass"].fillna(False)][TICK_COL].nunique()
-
-print(f"  Total tickers dataset original           : {total_tickers_orig:,}")
-print(f"  Sobrevivientes Close > ${UNIV_MIN_CLOSE:.0f}              : {n_after_close5:,}")
-print(f"  + Dollar_Volume > ${UNIV_MIN_DOLLAR_VOL_20D/1e6:.0f}M          : {n_after_dvol:,}")
-print(f"  + Zero_Returns < {UNIV_MAX_ZERO_RET_PCT_60D:.0%}               : {n_after_all:,}")
-
-# Mediana tickers por fecha
-train_pool_df  = df[df["_DateKey"].isin(TRAIN_DATES_POOL)]
-holdout_pool_df= df[df["_DateKey"].isin(HOLDOUT_DATES)]
-
-def median_tickers_per_date(d):
-    return d.groupby("_DateKey")[TICK_COL].nunique().median()
-
-med_train_before  = median_tickers_per_date(train_pool_df)
-med_train_after   = median_tickers_per_date(train_pool_df[train_pool_df["_univ_pass"].fillna(False)])
-med_hold_before   = median_tickers_per_date(holdout_pool_df)
-med_hold_after    = median_tickers_per_date(holdout_pool_df[holdout_pool_df["_univ_pass"].fillna(False)])
-
-print(f"\n  Mediana tickers/fecha — TRAIN   antes filtros: {med_train_before:.0f}  "
-      f"| después: {med_train_after:.0f}")
-print(f"  Mediana tickers/fecha — HOLDOUT antes filtros: {med_hold_before:.0f}  "
-      f"| después: {med_hold_after:.0f}")
-
-# ── FASE 1: FEATURES NUEVAS — DIAGNÓSTICO ────────────────────────
-print(f"\n\n{SEP}")
-print("=== FASE 1: FEATURES NUEVAS — DIAGNÓSTICO ===")
-print(SEP)
-
-train_df_for_diag = df[df["_DateKey"].isin(TRAIN_DATES_POOL) & df["y_t3"].notna()].copy()
-
-for feat in new_raw_features:
-    print(f"\n  ── {feat} ──")
-    col = df[feat].replace([np.inf, -np.inf], np.nan)
-
-    nan_pct = col.isna().mean()
-    print(f"    % NaN       : {nan_pct:.2%}")
-
-    if col.notna().sum() < 10:
-        print("    [WARN] Menos de 10 valores no-NaN. Feature posiblemente no computable.")
-        continue
-
-    q  = col.quantile([0.0, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0])
-    sk = float(col.skew())
-    print(f"    Min={q[0.0]:.4f}  P1={q[0.01]:.4f}  P25={q[0.25]:.4f}  "
-          f"Med={q[0.5]:.4f}  P75={q[0.75]:.4f}  P99={q[0.99]:.4f}  Max={q[1.0]:.4f}")
-    print(f"    Skewness    : {sk:.3f}")
-
-    # Correlación con features existentes (en train)
-    tr_sub = train_df_for_diag[[feat] + feature_cols_base].copy()
-    tr_sub = tr_sub.replace([np.inf, -np.inf], np.nan).dropna(subset=[feat])
-    if len(tr_sub) > 50:
-        corrs = tr_sub[feature_cols_base].corrwith(tr_sub[feat]).abs()
-        max_corr_feat = corrs.idxmax()
-        max_corr_val  = corrs.max()
-        print(f"    Máx corr c/existentes: {max_corr_feat} = {max_corr_val:.4f}", end="")
-        if max_corr_val > CORR_ALERT_THRESHOLD:
-            print(f"  *** ALERTA: correlación > {CORR_ALERT_THRESHOLD} ***")
-        else:
-            print()
-
-    # Correlación con target (Pearson) en train
-    tr_sub2 = train_df_for_diag[[feat, "y_t3"]].replace([np.inf, -np.inf], np.nan).dropna()
-    if len(tr_sub2) > 50:
-        corr_target = tr_sub2[feat].corr(tr_sub2["y_t3"])
-        print(f"    Corr con target (train): {corr_target:.4f}")
-
-# ── FASE 2: TRAINING ─────────────────────────────────────────────
-print(f"\n\n{SEP}")
-print("=== FASE 2: TRAINING (modelo NEW) ===")
-print(SEP)
-print(f"  Tiempo de entrenamiento : {m_new['TrainingTime_s']:.1f}s")
-print(f"  N features usadas       : {m_new['N_Features']}")
-print(f"  N árboles CLF (final)   : {m_new['N_Trees_clf']}")
-print(f"  N árboles RNK (final)   : {m_new['N_Trees_rnk']}")
-
-# ── FASE 3: MÉTRICAS BASELINE vs ABLATION vs NUEVO ────────────────
-print(f"\n\n{SEP}")
-print("=== FASE 3: MÉTRICAS COMPARATIVAS ===")
-print(SEP)
-
-def _fmt(v, fmt=".3f"):
-    # float() acepta int, numpy.float64, numpy.float32, etc.
-    try:
-        if v is None:
-            return "  N/A  "
-        fv = float(v)
-        return "  N/A  " if np.isnan(fv) else format(fv, fmt)
-    except (TypeError, ValueError):
-        return "  N/A  "
-
-def _delta(new_val, base_val, fmt=".3f"):
-    try:
-        nv, bv = float(new_val), float(base_val)
-        if np.isnan(nv) or np.isnan(bv):
-            return "  N/A"
-        d = nv - bv
-        return f"{'+'if d>=0 else ''}{d:{fmt}}"
-    except (TypeError, ValueError):
-        return "  N/A"
-
-rows = [
-    ("Métrica",                 "BASELINE",                      "ABLATION",                     "NEW",                          "Δ (NEW-BASE)"),
-    ("-" * 28,                  "-" * 10,                        "-" * 10,                       "-" * 10,                       "-" * 12),
-    (f"Holdout P@{TOP_K}",      _fmt(m_base["Holdout_P20"]),     _fmt(m_abl["Holdout_P20"]),     _fmt(m_new["Holdout_P20"]),     _delta(m_new["Holdout_P20"], m_base["Holdout_P20"])),
-    ("Holdout P@10",            _fmt(m_base["Holdout_P10"]),     _fmt(m_abl["Holdout_P10"]),     _fmt(m_new["Holdout_P10"]),     _delta(m_new["Holdout_P10"], m_base["Holdout_P10"])),
-    (f"Holdout NDCG@{TOP_K}",   _fmt(m_base["Holdout_NDCG20"]), _fmt(m_abl["Holdout_NDCG20"]), _fmt(m_new["Holdout_NDCG20"]),  _delta(m_new["Holdout_NDCG20"], m_base["Holdout_NDCG20"])),
-    ("Lift Holdout",            _fmt(m_base["Holdout_Lift"], ".2f"), _fmt(m_abl["Holdout_Lift"], ".2f"), _fmt(m_new["Holdout_Lift"], ".2f"), _delta(m_new["Holdout_Lift"], m_base["Holdout_Lift"], ".2f")),
-    ("Avg Ret Top-Bot (spread)", _fmt(m_base["AvgRet_Spread"]),  _fmt(m_abl["AvgRet_Spread"]),  _fmt(m_new["AvgRet_Spread"]),   _delta(m_new["AvgRet_Spread"], m_base["AvgRet_Spread"])),
-    ("Hit rate Top20 vs SPY",   _fmt(m_base["HitRate_vs_SPY"]), _fmt(m_abl["HitRate_vs_SPY"]), _fmt(m_new["HitRate_vs_SPY"]),  _delta(m_new["HitRate_vs_SPY"], m_base["HitRate_vs_SPY"])),
-    ("HHI sectorial Top20",     _fmt(m_base["HHI_Sectorial"]),  _fmt(m_abl["HHI_Sectorial"]),  _fmt(m_new["HHI_Sectorial"]),   _delta(m_new["HHI_Sectorial"], m_base["HHI_Sectorial"])),
-    (f"OOF P@{TOP_K}",          _fmt(m_base["OOF_P20"]),        _fmt(m_abl["OOF_P20"]),        _fmt(m_new["OOF_P20"]),         _delta(m_new["OOF_P20"], m_base["OOF_P20"])),
-    ("OOF-Holdout gap",         _fmt(m_base["OOF_Hold_Gap"]),   _fmt(m_abl["OOF_Hold_Gap"]),   _fmt(m_new["OOF_Hold_Gap"]),    _delta(m_new["OOF_Hold_Gap"], m_base["OOF_Hold_Gap"])),
-]
-
-col_w = [30, 12, 12, 12, 14]
-for row in rows:
-    print("  " + "".join(str(v).ljust(w) for v, w in zip(row, col_w)))
-
-print(f"\n  Ablation (filtros solos) Holdout P@{TOP_K}: {_fmt(m_abl['Holdout_P20'])}  "
-      f"(Δ vs baseline: {_delta(m_abl['Holdout_P20'], m_base['Holdout_P20'])})")
-
-# ── FASE 4: FEATURE IMPORTANCE ────────────────────────────────────
-print(f"\n\n{SEP}")
-print("=== FASE 4: FEATURE IMPORTANCE (modelo NEW — Top 20 by gain) ===")
-print(SEP)
-
-print(f"  {'Rank':<6} {'Feature':<40} {'Importance':>12}")
-print(f"  {'-'*6} {'-'*40} {'-'*12}")
-for _, row in fi_new.head(20).iterrows():
-    print(f"  {int(row['Rank']):<6} {row['Feature']:<40} {row['Importance']:>12.1f}")
-
-print(f"\n  Posición de cada feature nueva en el ranking:")
-for feat in new_raw_features:
-    sub = fi_new[fi_new["Feature"] == feat]
-    if len(sub):
-        pos = int(sub.iloc[0]["Rank"])
-        imp = float(sub.iloc[0]["Importance"])
-        alert = "  *** NO en top 30 ***" if pos > 30 else ""
-        print(f"    {feat:<45} rank={pos:>3}  imp={imp:.1f}{alert}")
-    else:
-        print(f"    {feat:<45} *** NO encontrada en feature_importance (puede estar como __rank) ***")
-
-# También checar variantes __rank
-print(f"\n  Variantes __rank de features nuevas:")
-for feat in new_rank_features:
-    sub = fi_new[fi_new["Feature"] == feat]
-    if len(sub):
-        pos = int(sub.iloc[0]["Rank"])
-        imp = float(sub.iloc[0]["Importance"])
-        alert = "  *** NO en top 30 ***" if pos > 30 else ""
-        print(f"    {feat:<45} rank={pos:>3}  imp={imp:.1f}{alert}")
-
-# ── FASE 5: ANÁLISIS POR FECHA ────────────────────────────────────
-print(f"\n\n{SEP}")
-print("=== FASE 5: ANÁLISIS POR FECHA (holdout) ===")
-print(SEP)
-
-sorted_dates = sorted(p20w_new.keys())
-print(f"\n  P@{TOP_K} por semana del holdout (BASELINE vs NEW):\n")
-print(f"  {'Fecha':<14} {'BASELINE':>10} {'NEW':>10} {'Δ':>8}")
-print(f"  {'-'*14} {'-'*10} {'-'*10} {'-'*8}")
-
-better_weeks, worse_weeks = 0, 0
-best_week_new, best_p_new = None, -1.0
-worst_week_new, worst_p_new = None, 2.0
-
-for dt in sorted_dates:
-    p_base_w = p20w_base.get(dt, np.nan)
-    p_new_w  = p20w_new.get(dt, np.nan)
-    d_str    = str(dt.date()) if hasattr(dt, "date") else str(dt)[:10]
-    delta    = (p_new_w - p_base_w) if (pd.notna(p_new_w) and pd.notna(p_base_w)) else np.nan
-
-    pb_s = f"{p_base_w:.3f}" if pd.notna(p_base_w) else " N/A "
-    pn_s = f"{p_new_w:.3f}"  if pd.notna(p_new_w)  else " N/A "
-    d_s  = f"{delta:+.3f}"   if pd.notna(delta)     else "  N/A"
-
-    print(f"  {d_str:<14} {pb_s:>10} {pn_s:>10} {d_s:>8}")
-
-    if pd.notna(delta):
-        if delta > 0:
-            better_weeks += 1
-        elif delta < 0:
-            worse_weeks += 1
-    if pd.notna(p_new_w):
-        if p_new_w > best_p_new:
-            best_p_new, best_week_new = p_new_w, dt
-        if p_new_w < worst_p_new:
-            worst_p_new, worst_week_new = p_new_w, dt
-
-print(f"\n  Semanas que MEJORAN vs baseline : {better_weeks}")
-print(f"  Semanas que EMPEORAN vs baseline: {worse_weeks}")
-best_d  = str(best_week_new.date())  if best_week_new  and hasattr(best_week_new,  "date") else str(best_week_new)[:10]
-worst_d = str(worst_week_new.date()) if worst_week_new and hasattr(worst_week_new, "date") else str(worst_week_new)[:10]
-print(f"  Mejor semana  : {best_d}  P@{TOP_K}={best_p_new:.3f}")
-print(f"  Peor semana   : {worst_d}  P@{TOP_K}={worst_p_new:.3f}")
-print(f"  Rank stability (corr Spearman rank_pred vs rank_actual): {m_new['RankStability']:.4f}")
-
-# ── FASE 6: PRÓXIMOS PASOS ────────────────────────────────────────
-print(f"\n\n{SEP}")
-print("=== FASE 6: PRÓXIMOS PASOS SUGERIDOS ===")
-print(SEP)
-
-# Feature más útil según importance
-top_new_feat = max(
-    [(f, fi_new[fi_new["Feature"] == f]["Importance"].values[0]
-      if len(fi_new[fi_new["Feature"] == f]) else 0.0)
-     for f in new_raw_features],
-    key=lambda x: x[1],
-)
-worst_new_feat = min(
-    [(f, fi_new[fi_new["Feature"] == f]["Importance"].values[0]
-      if len(fi_new[fi_new["Feature"] == f]) else 0.0)
-     for f in new_raw_features],
-    key=lambda x: x[1],
-)
-
-delta_hold  = m_new["Holdout_P20"] - m_base["Holdout_P20"]
-delta_filtr = m_abl["Holdout_P20"] - m_base["Holdout_P20"]
-recommend_next = delta_hold > 0.01
-
-print(f"""
-  1. Feature nueva más útil : {top_new_feat[0]}  (importance={top_new_feat[1]:.1f})
-     Feature nueva menos útil: {worst_new_feat[0]}  (importance={worst_new_feat[1]:.1f})
-     → Candidata a descartar/revisar si importance ≈ 0.
-
-  2. Contribución de filtros SOLO (ablation):
-     Holdout P@{TOP_K} baseline={m_base['Holdout_P20']:.3f}  ablation={m_abl['Holdout_P20']:.3f}
-     Δ filtros={delta_filtr:+.3f}
-     {'→ Los filtros SOLOS mueven la aguja positivamente.' if delta_filtr > 0 else
-      '→ Los filtros solos NO mejoran el holdout. El gain viene de las features.'}
-
-  3. Comparación full:
-     Δ NEW vs BASELINE = {delta_hold:+.3f}  (sobre holdout de {HOLDOUT_N_WEEKS_ACTUAL} semanas)
-     {'→ Resultado POSITIVO. Recomiendo avanzar a IVOL_FF3 + Residual_Reversal.' if recommend_next else
-      '→ Resultado NEUTRAL o NEGATIVO. Revisar antes de agregar más features.'}
-
-  4. ¿Avanzar con IVOL_FF3 + Residual_Reversal?
-     {'SÍ — el experimento muestra ganancia real (' + f'{delta_hold:+.3f}' + '). '
-      'Ambas features requieren retornos residuales (Fama-French 3F), lo que implica '
-      'descargar datos de factores. Si el gain se mantiene en más semanas de holdout, '
-      'el costo computacional se justifica.' if recommend_next else
-      'NO aún — el gain del MVP no es suficientemente robusto (' + f'{delta_hold:+.3f}' + '). '
-      'Primero investigar por qué las features nuevas no ayudan más: '
-      '¿datos de volumen ausentes? ¿lookback insuficiente con datos semanales?'}
-""")
-
-print(f"\n{SEP}")
-print("PIPELINE v5.0 — COMPLETADO")
-print(f"  BASELINE  : {OUT_FILE_BASELINE}")
-print(f"  ABLATION  : {OUT_FILE_ABLATION}")
-print(f"  NEW       : {OUT_FILE_NEW}")
-print(f"  Input hash: {INPUT_HASH}")
-print(SEP)
